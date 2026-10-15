@@ -33,6 +33,17 @@ Answer `y` when it lists missing tools and asks whether to install them, or add 
 
 The script does the six steps below in order and skips each one whose result is already there, so after a failure, or after `git pull`, you run the same command again and it continues. Each step's output is in `out\logs`; when a step fails the script prints the end of its log.
 
+### Optional Windows FidelityFX (experimental)
+
+For the experimental fork branch, clone
+`https://github.com/yukkibr/mcla-recomp.git`, select branch
+`feature/fidelityfx-upscaling`, and add `-FidelityFX` to `make_pc.ps1` to
+compile and package ReXGlue's FidelityFX DX12 integration.
+This exposes NATIVE/BILINEAR, CAS and spatial FSR1 in the in-game DISPLAY menu,
+plus an optional 2X draw scale (the latter increases GPU work). Do not confuse
+this with FSR3/FSR4/DLSS or reduced internal 3D resolution. Read
+`docs/phase2-fidelityfx.md` for build requirements and limitations.
+
 1. Checks that the tools are installed, and installs the missing ones if you agree.
 2. Clones the ReXGlue SDK v0.10.0 into `third_party\rexglue-sdk`, applies this project's patches and makes the one Windows-specific repair the checkout needs.
 3. Builds and installs the SDK: the long step, once.

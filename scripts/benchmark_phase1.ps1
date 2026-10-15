@@ -6,7 +6,8 @@ param(
     [ValidateRange(5, 120)][int]$TailSeconds = 20,
     [string]$Label = "baseline",
     [string]$Preset = "win-amd64-release",
-    [ValidateSet("d3d12", "vulkan")][string]$Backend = "d3d12"
+    [ValidateSet("d3d12", "vulkan")][string]$Backend = "d3d12",
+    [string[]]$ExtraArgs = @()
 )
 $ErrorActionPreference = "Stop"
 if ($Seconds -le $TailSeconds + 5) { throw "Seconds must exceed TailSeconds by at least 6" }
@@ -40,6 +41,7 @@ $metadata = [ordered]@{
     tail_seconds = $TailSeconds
     backend = $Backend
     preset = $Preset
+    extra_args = @($ExtraArgs)
     git_commit = ((& git -C $root rev-parse HEAD) | Out-String).Trim()
     git_branch = ((& git -C $root branch --show-current) | Out-String).Trim()
     executable_sha256 = Get-Sha256 $exe
@@ -70,7 +72,7 @@ try {
             "--fullscreen=false",
             "--log_file=$log",
             "--log_level=info"
-        )
+        ) + $ExtraArgs
         $env:REX_PERF_LOG_CSV = $csv
         $process = $null
         $samples = New-Object 'System.Collections.Generic.List[object]'

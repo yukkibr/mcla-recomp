@@ -17,7 +17,8 @@
 #   -Play        start the game when the build is done
 #   -InstallTools  install missing tools without asking first
 #   -Preset      CMake preset of the game build (default win-amd64-release)
-param([string]$Iso = "", [switch]$Play, [switch]$InstallTools, [string]$Preset = "win-amd64-release")
+#   -FidelityFX  opt in to ReXGlue's experimental AMD FidelityFX support (Windows D3D12)
+param([string]$Iso = "", [switch]$Play, [switch]$InstallTools, [switch]$FidelityFX, [string]$Preset = "win-amd64-release")
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot -Parent
@@ -156,15 +157,23 @@ try {
     # Get-Item otherwise, which would end the script under "Stop".
     $marker = Get-Item "$sdk\.mcla-patched" -Force
     $recompiler = Get-Item "$install\bin\rexglue.exe" -Force -ErrorAction SilentlyContinue
-    if (-not $recompiler -or $recompiler.LastWriteTime -lt $marker.LastWriteTime) {
+    $fxMode = if ($FidelityFX) { "ON" } else { "OFF" }
+    $fxStamp = "$install\.mcla-fidelityfx-mode"
+    $installedFxMode = if (Test-Path -LiteralPath $fxStamp) { (Get-Content -LiteralPath $fxStamp -Raw).Trim() } else { "" }
+    if (-not $recompiler -or $recompiler.LastWriteTime -lt $marker.LastWriteTime -or $installedFxMode -ne $fxMode) {
         Push-Location $sdk
         try {
-            Logged "sdk-configure" { cmake --preset win-amd64 -DREXGLUE_USE_VULKAN=ON -DREXGLUE_ENABLE_TRACY=OFF }
-            Logged "sdk-build" { cmake --build out\build\win-amd64 --config Release }
+            Logged "sdk-configure" { cmake --preset win-amd64 -DREXGLUE_USE_VULKAN=ON -DREXGLUE_ENABLE_TRACY=OFF "-DREXGLUE_ENABLE_FIDELITYFX=$fxMode" -DREXGLUE_FIDELITYFX_BACKEND=dx12 }
+            if ($FidelityFX) {
+                # The pinned FidelityFX RC resource is UTF-16, which Clang 20 rejects.
+                Logged "sdk-prepare-fidelityfx" { python "$PSScriptRoot\prepare_fidelityfx.py" "$sdk\out\build\win-amd64" }
+            }
+            Logged "sdk-build" { cmake --build out\build\win-amd64 --config Release --parallel 6 }
             Logged "sdk-install" { cmake --install out\build\win-amd64 --config Release }
+            Set-Content -LiteralPath $fxStamp -Value $fxMode -Encoding Ascii
         } finally { Pop-Location }
     } else {
-        "already installed: $install"
+        "already installed: $install (FidelityFX $fxMode)"
     }
     if (-not (Test-Path "$install\bin\rexglue.exe")) { Fail "the SDK was not installed" }
 
@@ -181,10 +190,15 @@ try {
 
     # -----------------------------------------------------------------------
     Step "5/6 recompile the game's code and build it (several minutes the first time)"
-    & "$PSScriptRoot\build.ps1" -Preset $Preset
+    & "$PSScriptRoot\build.ps1" -Preset $Preset -FidelityFX:$FidelityFX
     $build = "$root\out\build\$Preset"
     if (-not (Test-Path "$build\mcla.exe")) { Fail "mcla.exe was not built (log: $root\out\build.log)" }
     Copy-Item "$install\bin\rexgpu-xenos.dll" $build -Force
+    if ($FidelityFX) {
+        $fxDll = "$install\bin\amd_fidelityfx_dx12.dll"
+        if (-not (Test-Path -LiteralPath $fxDll)) { Fail "FidelityFX DLL missing: $fxDll" }
+        Copy-Item -LiteralPath $fxDll -Destination $build -Force
+    }
 
     # -----------------------------------------------------------------------
     Step "6/6 done"

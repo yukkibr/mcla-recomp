@@ -375,6 +375,21 @@ constexpr const char* kPromptLabels[] = {"AUTO", "XBOX", "PLAYSTATION"};
 constexpr const char* kIntroValues[] = {"normal", "fast", "skip"};
 constexpr const char* kIntroLabels[] = {"NORMAL", "FAST", "SKIP (NO LOGO)"};
 
+#if !REX_PLATFORM_PS5
+// Integer native draw resolution scaling (1x is the original 720p render).
+// This is supersampling, NOT a sub-native performance scale.
+constexpr double kDrawScales[] = {1.0, 2.0};
+#endif
+
+#if !REX_PLATFORM_PS5 && defined(MCLA_FIDELITYFX_MENU)
+// ReXGlue's spatial presentation effects. FSR 1 is an output upscaler, not
+// temporal FSR, DLSS, frame generation, or sub-native internal rendering.
+// Requires an SDK compiled with REXGLUE_ENABLE_FIDELITYFX=ON.
+constexpr const char* kUpscaleEffects[] = {"bilinear", "cas", "fsr"};
+constexpr const char* kUpscaleLabels[] = {"NATIVE (BILINEAR)", "AMD CAS", "AMD FSR 1"};
+constexpr double kFsrSharpnessReduction[] = {0.0, 0.2, 0.5, 1.0, 2.0};
+#endif
+
 const ItemDef kDisplayItems[] = {
     {"PM_MxFps", ItemKind::kNumberChoice, "mcla_fps", "FPS TARGET", nullptr, nullptr, kFpsTargets,
      kFpsTargetCount, "%.0f", "UNCAPPED"},
@@ -383,7 +398,15 @@ const ItemDef kDisplayItems[] = {
     // the PS5 host turns the emulated vsync off at every start.
     {"PM_MxVsync", ItemKind::kToggle, "vsync", "VSYNC"},
     {"PM_MxFullscreen", ItemKind::kToggle, "fullscreen", "FULLSCREEN"},
-#endif
+    {"PM_MxDrawScale", ItemKind::kNumberChoice, "resolution_scale",
+     "DRAW SCALE (NEXT START)", nullptr, nullptr, kDrawScales, 2, "%.0fX"},
+#if defined(MCLA_FIDELITYFX_MENU)
+    {"PM_MxUpscale", ItemKind::kStringChoice, "present_effect", "UPSCALER (NEXT START)",
+     kUpscaleEffects, kUpscaleLabels, nullptr, 3},
+    {"PM_MxFsrSharp", ItemKind::kNumberChoice, "present_fsr_sharpness_reduction",
+     "FSR SOFTENING (NEXT START)", nullptr, nullptr, kFsrSharpnessReduction, 5, "%.1f"},
+#endif  // MCLA_FIDELITYFX_MENU
+#endif  // !REX_PLATFORM_PS5
     {"PM_MxMotionBlur", ItemKind::kToggle, "mcla_motion_blur", "MOTION BLUR"},
     {"PM_MxDof", ItemKind::kToggle, "mcla_depth_of_field", "DEPTH OF FIELD"},
 };

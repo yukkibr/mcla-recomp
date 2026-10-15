@@ -34,6 +34,13 @@ endif()
 
 rexglue_setup_target(mcla)
 
+# The presenter effects are only offered in-game when the SDK was built with
+# optional FidelityFX. The default/PS5 build must not show unusable choices.
+option(MCLA_ENABLE_FIDELITYFX_MENU "Expose built FidelityFX controls in the MCLA menu" OFF)
+if(WIN32 AND MCLA_ENABLE_FIDELITYFX_MENU)
+    target_compile_definitions(mcla PRIVATE MCLA_FIDELITYFX_MENU=1)
+endif()
+
 if(WIN32)
     # timeBeginPeriod for the frame limiter.
     target_link_libraries(mcla PRIVATE winmm)
