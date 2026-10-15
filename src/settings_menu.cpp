@@ -55,8 +55,25 @@ REXCVAR_DEFINE_STRING(mcla_render_quality, "native", "MCLA",
 void MclaApplyGuestRenderPreset() {
 #if !REX_PLATFORM_PS5
   const std::string choice = REXCVAR_GET(mcla_render_quality);
-  if (choice == "native" && !rex::cvar::HasNonDefaultValue("mcla_render_quality")) {
-    return;  // Keep command-line guest video mode overrides when no preset is chosen.
+  // "native" is the default CVar value, so ReXGlue's SaveConfig omits it.
+  // An old PERFORMANCE run can leave video_mode_width/height=854/480 in
+  // mcla.toml. Skipping the native preset when it is the default would then
+  // silently keep rendering at 480p even though the UI says NATIVE 720P.
+  //
+  // Only explicit CLI/environment video-mode overrides without a render
+  // preset should take precedence. Persisted video_mode_* values from a
+  // previous preset must NOT mask NATIVE selected in the in-game menu.
+  const auto quality_source = rex::cvar::GetFlagSource("mcla_render_quality");
+  const auto width_source = rex::cvar::GetFlagSource("video_mode_width");
+  const auto height_source = rex::cvar::GetFlagSource("video_mode_height");
+  auto explicit_video_override = [](rex::cvar::Source source) {
+    return source == rex::cvar::Source::kCommandLine ||
+           source == rex::cvar::Source::kEnvironment;
+  };
+  if (choice == "native" && quality_source == rex::cvar::Source::kDefault &&
+      (explicit_video_override(width_source) || explicit_video_override(height_source))) {
+    REXLOG_INFO("MCLA guest render: native preset deferred to explicit host video mode");
+    return;
   }
   int width = 1280, height = 720;
   if (choice == "quality") {

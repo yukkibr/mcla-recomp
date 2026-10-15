@@ -47,9 +47,22 @@ For diagnostic command-line testing (not official AMD quality levels):
 ```
 
 The config `mcla_render_quality` selects the matching Xbox video mode
-before the GPU initializes; each mode is saved in the existing `mcla.toml`
-when selected in the in-game menu. Explicit custom Xbox video modes can
-still be supplied manually when no render preset has been set.
+before the GPU initializes. Non-default presets are saved in the existing
+`mcla.toml` when selected in the in-game menu. Note that **NATIVE (720p)
+is the default**, so ReXGlue's config serializer intentionally omits
+`mcla_render_quality = "native"` on save.
+
+As of the `fix/native-720p-preset` patch, NATIVE forces **1280x720**
+at the guest-render stage even if a previous PERFORMANCE run saved
+`video_mode_width = 854` and `video_mode_height = 480`. Before the
+fix, NATIVE incorrectly skipped the preset application when its CVar had
+the default value, silently leaving the guest at 480p.
+
+Explicit custom guest video modes can still be supplied by command-line
+`--video_mode_width` / `--video_mode_height` (or environment) when
+`--mcla_render_quality` was not explicitly supplied. A custom output
+window size, `--window_width` / `--window_height`, is **not** the same
+as the guest's internal render resolution.
 
 ## Dense urban areas (PERFORMANCE)
 
