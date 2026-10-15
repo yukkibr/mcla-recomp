@@ -41,6 +41,15 @@ REXCVAR_DEFINE_INT32(mcla_fps, 30, "MCLA",
                      "-1 restores the game's original fixed 30 Hz timing")
     .range(-1, 240);
 
+// Limit the maximum guest time step when a texture streaming or CPU stall
+// produces a very late frame. This limits simulation jumps but cannot make
+// the host render faster; smaller caps may cause brief slow-motion instead.
+// 125 ms matches the previously shipped behavior (no change by default).
+REXCVAR_DEFINE_INT32(mcla_frame_stall_guard_ms, 125, "MCLA",
+                     "Maximum real frame time advanced in one guest simulation "
+                     "step after a hitch (50, 67, 125 ms)")
+    .range(33, 125);
+
 // Off by default: skipping here also skips whatever puts the game logo on the
 // title screen (only "PRESS START" remains). Tested with and without the
 // render-pass mask change; the logo is missing either way.
@@ -59,9 +68,11 @@ namespace {
 constexpr uint32_t kGuestFrameDelta = 0x827D7508;  // seconds, time-scaled
 constexpr uint32_t kGuestFrameRate = 0x827D750C;   // 1 / delta
 
-// Longest time one frame may advance the game clock. A streaming stall must
-// not reach physics and audio as one huge step.
-constexpr double kMaxFrameSeconds = 0.125;
+// The previous 125 ms hard limit is still the default. Alternative limits
+// are opt-in for users who see camera / physics jumps after large CPU stalls.
+double MaxGuestFrameSeconds() {
+  return static_cast<double>(REXCVAR_GET(mcla_frame_stall_guard_ms)) / 1000.0;
+}
 
 // Set when the frame limiter has run; see PaceUnlimitedSwap.
 std::atomic<bool> g_limiter_ran_since_swap{false};
@@ -144,8 +155,8 @@ void mcla_frame_delta(PPCRegister& r8) {
   g_limiter_ran_since_swap.store(true, std::memory_order_relaxed);
   // r8 was computed before the wait. Whatever the wait added is picked up by
   // the next frame's measurement, so no time is lost, only shifted one frame.
-  static const uint64_t max_ticks = static_cast<uint64_t>(
-      kMaxFrameSeconds * static_cast<double>(rex::chrono::Clock::guest_tick_frequency()));
+  const uint64_t max_ticks = static_cast<uint64_t>(
+      MaxGuestFrameSeconds() * static_cast<double>(rex::chrono::Clock::guest_tick_frequency()));
   if (r8.u64 > max_ticks) {
     r8.u64 = max_ticks;
   }
@@ -159,7 +170,13 @@ void mcla_fixed_step_path(PPCRegister& r3, PPCRegister& f11) {
   if (OriginalTiming()) {
     return;
   }
-  f11.f64 = static_cast<double>(ReadGuestFloat(r3.u32 + 0x58));
+  // The second fixed-step path reads the measured delta from guest memory.
+  // Clamp this path too, otherwise large streaming stalls may reach the
+  // physics / camera simulation even when the earlier r8 hook was clamped.
+  const double measured_delta = static_cast<double>(ReadGuestFloat(r3.u32 + 0x58));
+  if (std::isfinite(measured_delta) && measured_delta >= 0.0) {
+    f11.f64 = std::min(measured_delta, MaxGuestFrameSeconds());
+  }
 }
 
 // Loops that never reach the engine timer (the publisher logos at start-up,
@@ -203,7 +220,8 @@ static void RescaleCameraFactor(PPCRegister& reg) {
   if (OriginalTiming()) {
     return;
   }
-  const double dt = ReadGuestFloat(kGuestFrameDelta);
+  const double dt = std::min(static_cast<double>(ReadGuestFloat(kGuestFrameDelta)),
+                             MaxGuestFrameSeconds());
   const double raw = reg.f64;
   if (raw <= 0.0 || raw >= 1.0 || dt <= 0.0) {
     return;
@@ -228,7 +246,8 @@ void mcla_chassis_depth_smoothing(PPCRegister& f0) {
   if (OriginalTiming()) {
     return;
   }
-  const double dt = ReadGuestFloat(kGuestFrameDelta);
+  const double dt = std::min(static_cast<double>(ReadGuestFloat(kGuestFrameDelta)),
+                             MaxGuestFrameSeconds());
   if (dt > 0.0) {
     f0.f64 = PerFrameToContinuous(0.10, dt);
   }
@@ -262,6 +281,8 @@ void MclaApp::ConfigureFrameTiming() {
   // Default Windows timer granularity is 15.6 ms; sleeps need 1 ms.
   timeBeginPeriod(1);
 #endif
-  REXLOG_INFO("frame timing: real frame delta, target {} FPS, vsync {}", REXCVAR_GET(mcla_fps),
-              rex::cvar::GetFlagByName("vsync"));
+  REXLOG_INFO("frame timing: real frame delta, target {} FPS, vsync {}, "
+              "max guest step {} ms",
+              REXCVAR_GET(mcla_fps), rex::cvar::GetFlagByName("vsync"),
+              REXCVAR_GET(mcla_frame_stall_guard_ms));
 }

@@ -31,8 +31,12 @@
 #include <rex/ui/windowed_app_context.h>
 
 #if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #endif
 
@@ -449,6 +453,12 @@ constexpr double kFpsTargets[] = {30.0, 60.0};
 constexpr double kFpsTargets[] = {30.0, 60.0, 120.0, 0.0};
 #endif
 constexpr int kFpsTargetCount = int(sizeof(kFpsTargets) / sizeof(kFpsTargets[0]));
+#if !REX_PLATFORM_PS5
+// Limits huge guest simulation steps after streaming stalls. Smaller steps
+// exchange post-hitch camera/vehicle jumps for a brief loss of game time.
+constexpr const char* kStallGuardValues[] = {"125", "67", "50"};
+constexpr const char* kStallGuardLabels[] = {"ORIGINAL", "GENTLE", "STRONG"};
+#endif
 constexpr const char* kPromptValues[] = {"auto", "xbox", "playstation"};
 constexpr const char* kPromptLabels[] = {"AUTO", "XBOX", "PLAYSTATION"};
 constexpr const char* kIntroValues[] = {"normal", "fast", "skip"};
@@ -476,6 +486,8 @@ const ItemDef kDisplayItems[] = {
     {"PM_MxFps", ItemKind::kNumberChoice, "mcla_fps", "FPS TARGET", nullptr, nullptr, kFpsTargets,
      kFpsTargetCount, "%.0f", "UNCAPPED"},
 #if !REX_PLATFORM_PS5
+    {"PM_MxFrameGuard", ItemKind::kStringChoice, "mcla_frame_stall_guard_ms",
+     "FRAME STALL GUARD", kStallGuardValues, kStallGuardLabels, nullptr, 3},
     // Neither means anything on the console: there is one display mode, and
     // the PS5 host turns the emulated vsync off at every start.
     {"PM_MxVsync", ItemKind::kToggle, "vsync", "VSYNC"},
