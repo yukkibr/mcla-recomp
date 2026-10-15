@@ -18,6 +18,10 @@
 *.key
 keys.*
 
+# Python development tooling
+__pycache__/
+*.pyc
+
 # Build output
 /build/
 /out/
