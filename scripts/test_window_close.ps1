@@ -1,5 +1,5 @@
 # Automated test for the normal window close lifecycle, no in-game inputs.
-param([int]$WarmupSeconds = 12, [int]$TimeoutSeconds = 25)
+param([int]$WarmupSeconds = 12, [int]$TimeoutSeconds = 25, [string[]]$ExtraArgs = @())
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 $build = Join-Path $root 'out\build\win-amd64-release'
@@ -12,11 +12,13 @@ public static class QuitQA {
  [DllImport("user32.dll", SetLastError=true)] public static extern bool PostMessage(IntPtr hwnd, uint msg, IntPtr wparam, IntPtr lparam);
 }
 "@
-$p = Start-Process -FilePath (Join-Path $build 'mcla.exe') -ArgumentList @(
+$argsList = @(
  "--game_data_root=$root\game", '--gpu_plugin=xenos',
  '--mcla_gpu_backend=d3d12', '--fullscreen=false',
  '--mcla_intro=fast', '--mcla_fps=30',
- "--log_file=$log", '--log_level=info') -WorkingDirectory $build -PassThru
+ "--log_file=$log", '--log_level=info'
+) + $ExtraArgs
+$p = Start-Process -FilePath (Join-Path $build 'mcla.exe') -ArgumentList $argsList -WorkingDirectory $build -PassThru
 try {
  Start-Sleep -Seconds $WarmupSeconds
  $p.Refresh()

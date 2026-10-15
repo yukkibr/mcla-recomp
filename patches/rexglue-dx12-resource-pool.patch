@@ -1,0 +1,228 @@
+diff --git a/include/rex/graphics/d3d12/texture_cache.h b/include/rex/graphics/d3d12/texture_cache.h
+index 4d845c7..ecf431d 100644
+--- a/include/rex/graphics/d3d12/texture_cache.h
++++ b/include/rex/graphics/d3d12/texture_cache.h
+@@ -223,6 +223,22 @@ class D3D12TextureCache final : public TextureCache {
+     uint32_t swizzle;
+   };
+ 
++  // Only recycle resources after their last GPU submission has completed.
++  // The stored COM reference exclusively owns the GPU texture until checkout.
++  struct PooledResource {
++    D3D12_RESOURCE_DESC desc;
++    Microsoft::WRL::ComPtr<ID3D12Resource> resource;
++    D3D12_RESOURCE_STATES state;
++    uint64_t bytes;
++  };
++  void RecycleTextureResource(ID3D12Resource* resource, D3D12_RESOURCE_STATES state,
++                              uint64_t last_submission, uint64_t bytes);
++  std::vector<PooledResource> resource_pool_;
++  uint64_t resource_pool_bytes_ = 0;
++  uint64_t resource_pool_limit_bytes_ = 0;
++  uint64_t resource_pool_hits_ = 0;
++  uint64_t resource_pool_misses_ = 0;
++
+   class D3D12Texture final : public Texture {
+    public:
+     union SRVDescriptorKey {
+diff --git a/src/graphics/d3d12/texture_cache.cpp b/src/graphics/d3d12/texture_cache.cpp
+index 2be0e8e..c896e1d 100644
+--- a/src/graphics/d3d12/texture_cache.cpp
++++ b/src/graphics/d3d12/texture_cache.cpp
+@@ -11,6 +11,8 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <chrono>
++#include <cstdlib>
+ #include <cfloat>
+ #include <cstddef>
+ #include <cstring>
+@@ -18,6 +20,7 @@
+ #include <utility>
+ 
+ #include <rex/assert.h>
++#include <rex/cvar.h>
+ #include <rex/dbg.h>
+ #include <rex/graphics/d3d12/command_processor.h>
+ #include <rex/graphics/d3d12/shared_memory.h>
+@@ -32,6 +35,11 @@
+ #include <rex/ui/d3d12/d3d12_upload_buffer_pool.h>
+ #include <rex/ui/d3d12/d3d12_util.h>
+ 
++REXCVAR_DEFINE_INT32(d3d12_texture_resource_pool_mb, 0, "GPU",
++                     "Experimental bounded reuse pool for completed D3D12 textures (MB)")
++    .range(0, 256)
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++
+ namespace rex::graphics::d3d12 {
+ 
+ // Generated with `xb buildshaders`.
+@@ -371,12 +379,25 @@ D3D12TextureCache::D3D12TextureCache(const RegisterFile& register_file,
+                                      bool bindless_resources_used)
+     : TextureCache(register_file, shared_memory, draw_resolution_scale_x, draw_resolution_scale_y),
+       command_processor_(command_processor),
+-      bindless_resources_used_(bindless_resources_used) {}
++      bindless_resources_used_(bindless_resources_used) {
++  resource_pool_limit_bytes_ =
++      uint64_t(std::max(0, REXCVAR_GET(d3d12_texture_resource_pool_mb))) << 20;
++  if (resource_pool_limit_bytes_) {
++    REXGPU_INFO("DX12 texture resource reuse experiment: {} MB",
++                resource_pool_limit_bytes_ >> 20);
++  }
++}
+ 
+ D3D12TextureCache::~D3D12TextureCache() {
+   // While the texture descriptor cache still exists (referenced by
+   // ~D3D12Texture), destroy all textures.
+   DestroyAllTextures(true);
++  if (resource_pool_limit_bytes_) {
++    REXGPU_INFO("DX12 resource pool: {} hits, {} misses", resource_pool_hits_,
++                resource_pool_misses_);
++  }
++  resource_pool_.clear();
++  resource_pool_bytes_ = 0;
+ 
+   // First release the buffers to detach them from the heaps.
+   for (std::unique_ptr<ScaledResolveVirtualBuffer>& scaled_resolve_buffer_ptr :
+@@ -647,6 +668,8 @@ bool D3D12TextureCache::Initialize() {
+ 
+ void D3D12TextureCache::ClearCache() {
+   TextureCache::ClearCache();
++  resource_pool_.clear();
++  resource_pool_bytes_ = 0;
+ 
+   // Clear texture descriptor cache.
+   srv_descriptor_cache_free_.clear();
+@@ -1427,6 +1450,9 @@ D3D12TextureCache::D3D12Texture::~D3D12Texture() {
+   for (const auto& descriptor_pair : srv_descriptors_) {
+     d3d12_texture_cache.ReleaseTextureDescriptor(descriptor_pair.second);
+   }
++  d3d12_texture_cache.RecycleTextureResource(
++      resource_.Get(), resource_state_, last_usage_submission_index(),
++      GetHostMemoryUsage());
+ }
+ 
+ bool D3D12TextureCache::IsDecompressionNeeded(xenos::TextureFormat format, uint32_t width,
+@@ -1516,6 +1542,30 @@ uint32_t D3D12TextureCache::GetMaxHostTextureDepthOrArraySize(
+   }
+ }
+ 
++void D3D12TextureCache::RecycleTextureResource(
++    ID3D12Resource* resource, D3D12_RESOURCE_STATES state, uint64_t last_submission,
++    uint64_t bytes) {
++  // A cached resource may be reclaimed only when no queued GPU command
++  // references it. Never recycle untracked textures (submission 0).
++  if (!resource_pool_limit_bytes_ || !resource || !bytes ||
++      bytes > resource_pool_limit_bytes_ || !last_submission ||
++      last_submission > command_processor_.GetCompletedSubmission()) {
++    return;
++  }
++  while (!resource_pool_.empty() &&
++         resource_pool_bytes_ + bytes > resource_pool_limit_bytes_) {
++    resource_pool_bytes_ -= resource_pool_.front().bytes;
++    resource_pool_.erase(resource_pool_.begin());
++  }
++  PooledResource entry{};
++  entry.desc = resource->GetDesc();
++  entry.resource = resource;
++  entry.state = state;
++  entry.bytes = bytes;
++  resource_pool_.push_back(std::move(entry));
++  resource_pool_bytes_ += bytes;
++}
++
+ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(TextureKey key) {
+   D3D12_RESOURCE_DESC desc;
+   desc.Format = GetDXGIResourceFormat(key);
+@@ -1549,11 +1599,61 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(TextureK
+   // Assuming untiling will be the next operation.
+   D3D12_RESOURCE_STATES resource_state = D3D12_RESOURCE_STATE_COPY_DEST;
+   Microsoft::WRL::ComPtr<ID3D12Resource> resource;
++  if (resource_pool_limit_bytes_) {
++    for (size_t i = resource_pool_.size(); i-- > 0;) {
++      const auto& candidate = resource_pool_[i];
++      const auto& old = candidate.desc;
++      if (old.Dimension != desc.Dimension || old.Alignment != desc.Alignment ||
++          old.Width != desc.Width || old.Height != desc.Height ||
++          old.DepthOrArraySize != desc.DepthOrArraySize ||
++          old.MipLevels != desc.MipLevels || old.Format != desc.Format ||
++          old.SampleDesc.Count != desc.SampleDesc.Count ||
++          old.SampleDesc.Quality != desc.SampleDesc.Quality ||
++          old.Layout != desc.Layout || old.Flags != desc.Flags) {
++        continue;
++      }
++      D3D12_RESOURCE_STATES old_state = candidate.state;
++      resource = candidate.resource;
++      resource_pool_bytes_ -= candidate.bytes;
++      resource_pool_.erase(resource_pool_.begin() + i);
++      // Reused GPU storage is not reused guest texture data: a fresh
++      // upload will overwrite the texture before it is sampled.
++      if (old_state != resource_state) {
++        command_processor_.PushTransitionBarrier(resource.Get(), old_state,
++                                                  resource_state);
++      }
++      ++resource_pool_hits_;
++      if ((resource_pool_hits_ & (resource_pool_hits_ - 1)) == 0) {
++        REXGPU_INFO("DX12 texture resource pool: {} successful reuses",
++                    resource_pool_hits_);
++      }
++      return std::unique_ptr<Texture>(
++          new D3D12Texture(*this, key, resource.Get(), resource_state));
++    }
++    ++resource_pool_misses_;
++    if (resource_pool_misses_ == 1024) {
++      REXGPU_INFO("DX12 texture resource pool: 1024 misses, {} reuses",
++                  resource_pool_hits_);
++    }
++  }
++#ifdef REXGLUE_ENABLE_PERF_COUNTERS
++  static const bool profile_allocations = std::getenv("REX_PERF_LOG_CSV") != nullptr;
++  const auto resource_start =
++      profile_allocations ? std::chrono::steady_clock::now()
++                          : std::chrono::steady_clock::time_point{};
++#endif
+   if (FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesDefault,
+                                              provider.GetHeapFlagCreateNotZeroed(), &desc,
+                                              resource_state, nullptr, IID_PPV_ARGS(&resource)))) {
+     return nullptr;
+   }
++#ifdef REXGLUE_ENABLE_PERF_COUNTERS
++  if (profile_allocations) {
++    PROFILE_TEXTURE_RESOURCE_CREATE_US(
++        std::chrono::duration_cast<std::chrono::microseconds>(
++            std::chrono::steady_clock::now() - resource_start).count());
++  }
++#endif
+   return std::unique_ptr<Texture>(new D3D12Texture(*this, key, resource.Get(), resource_state));
+ }
+ 
+@@ -2049,6 +2149,14 @@ uint32_t D3D12TextureCache::FindOrCreateTextureDescriptor(D3D12Texture& texture,
+     return existing_descriptor_index;
+   }
+   PROFILE_TEXTURE_CACHE_MISS();
++#ifdef REXGLUE_ENABLE_PERF_COUNTERS
++  // Instrument CPU creation of a missing SRV; this existing 'texture cache
++  // miss' counter is about descriptors, not a disk/texture-streaming miss.
++  static const bool profile_descriptors = std::getenv("REX_PERF_LOG_CSV") != nullptr;
++  const auto descriptor_start =
++      profile_descriptors ? std::chrono::steady_clock::now()
++                          : std::chrono::steady_clock::time_point{};
++#endif
+ 
+   TextureKey texture_key = texture.key();
+ 
+@@ -2165,6 +2273,13 @@ uint32_t D3D12TextureCache::FindOrCreateTextureDescriptor(D3D12Texture& texture,
+   device->CreateShaderResourceView(resource_for_view, &desc,
+                                    GetTextureDescriptorCPUHandle(descriptor_index));
+   texture.AddSRVDescriptorIndex(descriptor_key, descriptor_index);
++#ifdef REXGLUE_ENABLE_PERF_COUNTERS
++  if (profile_descriptors) {
++    PROFILE_TEXTURE_DESCRIPTOR_CREATE_US(
++        std::chrono::duration_cast<std::chrono::microseconds>(
++            std::chrono::steady_clock::now() - descriptor_start).count());
++  }
++#endif
+   return descriptor_index;
+ }
+ 

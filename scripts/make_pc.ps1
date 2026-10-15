@@ -156,6 +156,11 @@ try {
         Patch "sdk-patch-resource-timings" $sdk "$root\patches\rexglue-dx12-resource-timings.patch"
         (Get-Item "$sdk\.mcla-patched" -Force).LastWriteTime = Get-Date
     }
+    # Opt-in bounded D3D12 resource reuse pool, disabled by default.
+    if (-not (Select-String -Quiet -SimpleMatch "resource_pool_limit_bytes_" "$sdk\include\rex\graphics\d3d12\texture_cache.h")) {
+        Patch "sdk-patch-resource-pool" $sdk "$root\patches\rexglue-dx12-resource-pool.patch"
+        (Get-Item "$sdk\.mcla-patched" -Force).LastWriteTime = Get-Date
+    }
 
     # -----------------------------------------------------------------------
     Step "3/6 build and install the SDK (the long step, once)"
