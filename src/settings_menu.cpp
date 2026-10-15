@@ -502,6 +502,7 @@ constexpr double kFsrSharpnessReduction[] = {0.0, 0.2, 0.5, 1.0, 2.0};
 const ItemDef kDisplayItems[] = {
     {"PM_MxFps", ItemKind::kNumberChoice, "mcla_fps", "FPS TARGET", nullptr, nullptr, kFpsTargets,
      kFpsTargetCount, "%.0f", "UNCAPPED"},
+    {"PM_MxFpsCounter", ItemKind::kToggle, "mcla_show_fps", "FPS COUNTER"},
 #if !REX_PLATFORM_PS5
     {"PM_MxFrameGuard", ItemKind::kStringChoice, "mcla_frame_stall_guard_ms",
      "FRAME STALL GUARD", kStallGuardValues, kStallGuardLabels, nullptr, 3},

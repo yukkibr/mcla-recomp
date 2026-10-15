@@ -20,10 +20,13 @@ class MclaApp : public rex::ReXApp {
   void OnConfigurePaths(rex::PathConfig& paths) override;
   void OnPreSetup(rex::RuntimeConfig& config) override;
   void OnPostSetup() override;
+  void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override;
+  void OnShutdown() override;
   void OnPreLaunchModule() override;
 
  private:
   void InstallCrashTrace();
   void ConfigureFrameTiming();
   void StartProfilerIfRequested();
+  std::unique_ptr<rex::ui::ImGuiDialog> fps_overlay_;
 };

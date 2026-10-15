@@ -13,6 +13,7 @@
 #include "generated/default/mcla_init.h"
 
 #include "mcla_app.h"
+#include "fps_overlay.h"
 
 #include <algorithm>
 #include <atomic>
@@ -201,6 +202,8 @@ static void PaceUnlimitedSwap() {
 }
 
 bool mcla_present_interval(PPCRegister& r11) {
+  // Actual guest present requests, not target FPS and not an SDK profiler.
+  MclaRecordGuestPresent();
   if (OriginalTiming()) {
     return false;
   }

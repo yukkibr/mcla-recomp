@@ -1,6 +1,7 @@
 #include "generated/default/mcla_init.h"
 
 #include "mcla_app.h"
+#include "fps_overlay.h"
 
 #include <filesystem>
 
@@ -58,8 +59,27 @@ void MclaApp::OnPreSetup(rex::RuntimeConfig& config) {
   }
 }
 
+void MclaApp::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
+  fps_overlay_ = MclaCreateFpsHud(drawer);
+}
+
+void MclaApp::OnShutdown() {
+  // Destroy the dialog while the base class still owns the ImGui drawer.
+  fps_overlay_.reset();
+}
+
 void MclaApp::OnPostSetup() {
   ConfigureFrameTiming();
+  // The SDK F3 diagnostics were missing a frame-stats provider in this game.
+  // The compact MCLA FPS HUD uses the same lightweight guest-present samples.
+  SetGuestFrameStats([]() {
+    const auto sample = MclaReadGuestFps();
+    rex::ui::FrameStats result{};
+    result.fps = sample.fps;
+    result.frame_time_ms = sample.frame_time_ms;
+    result.frame_count = sample.frame_count;
+    return result;
+  });
 
 
   // The game probes for loose city data on a "t:" drive that retail consoles

@@ -17,6 +17,7 @@ set(MCLA_SOURCES
     src/crash_trace.cpp
     src/audio_fallback.cpp
     src/frame_timing.cpp
+    src/fps_overlay.cpp
     src/render_perf.cpp
     src/perf_options.cpp
     src/warp_fix.cpp
