@@ -31,7 +31,9 @@
 #include <rex/ui/windowed_app_context.h>
 
 #if defined(_WIN32)
-#include <SDL3/SDL_events.h>
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
 #endif
 
 REXCVAR_DEFINE_BOOL(mcla_motion_blur, true, "MCLA", "Motion blur");
@@ -501,10 +503,22 @@ constexpr double kDensityScales[] = {0.0, 0.5, 1.0};
 constexpr double kTrafficDistances[] = {250.0, 325.0, 400.0};
 constexpr const char* kCityProfileValues[] = {"custom", "standard", "balanced", "performance", "minimum"};
 constexpr const char* kCityProfileLabels[] = {"CUSTOM", "STANDARD", "BALANCED", "PERFORMANCE", "MINIMUM"};
+#if !REX_PLATFORM_PS5
+// In auto mode ReXGlue starts 3/4 of all logical CPUs as pipeline workers;
+// on a 24-thread Xeon this means 18 workers. Let players trade initial shader
+// compilation speed for less CPU contention with GPU command translation.
+constexpr const char* kPipelineWorkerValues[] = {"-1", "2", "4", "8"};
+constexpr const char* kPipelineWorkerLabels[] = {"AUTO", "2 THREADS", "4 THREADS", "8 THREADS"};
+#endif
 
 const ItemDef kPerformanceItems[] = {
     {"PM_MxCityProfile", ItemKind::kStringChoice, "mcla_city_profile",
      "CITY PRESET", kCityProfileValues, kCityProfileLabels, nullptr, 5},
+#if !REX_PLATFORM_PS5
+    {"PM_MxPipelineWorkers", ItemKind::kStringChoice, "d3d12_pipeline_creation_threads",
+     "DX12 PIPELINE WORKERS (NEXT START)", kPipelineWorkerValues,
+     kPipelineWorkerLabels, nullptr, 4},
+#endif
     {"PM_MxSingleTile", ItemKind::kToggle, "mcla_single_tile", "SINGLE TILE RENDERING"},
     {"PM_MxFenceYield", ItemKind::kToggle, "mcla_fence_yield", "GPU WAIT YIELD"},
     {"PM_MxShadows", ItemKind::kToggle, "mcla_shadows", "SHADOWS"},
@@ -949,6 +963,54 @@ bool ButtonClicked(uint32_t key) {
   return key && CallGuest(kIsButtonClickedFn, key, 1u) != 0;
 }
 
+#if defined(_WIN32)
+// WM_CLOSE is intentionally preferred over synthetic SDL_EVENT_QUIT. In the
+// application's real SDL window proc it runs the same OnClosing sequence
+// tested by scripts/test_window_close.ps1, shutting down guest, GPU and audio
+// before ending the UI loop.
+struct MclaWindowSearch {
+  HWND titled_window = nullptr;
+  HWND fallback_window = nullptr;
+};
+
+BOOL CALLBACK FindMclaWindow(HWND hwnd, LPARAM data) {
+  DWORD pid = 0;
+  GetWindowThreadProcessId(hwnd, &pid);
+  if (pid != GetCurrentProcessId() || !IsWindowVisible(hwnd) ||
+      GetWindow(hwnd, GW_OWNER) != nullptr) {
+    return TRUE;
+  }
+  auto* result = reinterpret_cast<MclaWindowSearch*>(data);
+  if (!result->fallback_window) {
+    result->fallback_window = hwnd;
+  }
+  char title[160] = {};
+  GetWindowTextA(hwnd, title, sizeof(title));
+  if (std::strstr(title, "mcla") != nullptr) {
+    result->titled_window = hwnd;
+    return FALSE;
+  }
+  return TRUE;
+}
+
+bool RequestHostWindowClose() {
+  MclaWindowSearch windows{};
+  EnumWindows(FindMclaWindow, reinterpret_cast<LPARAM>(&windows));
+  HWND hwnd = windows.titled_window ? windows.titled_window : windows.fallback_window;
+  if (!hwnd) {
+    REXLOG_ERROR("settings menu: QUIT GAME could not locate the MCLA window");
+    return false;
+  }
+  if (!PostMessageW(hwnd, WM_CLOSE, 0, 0)) {
+    REXLOG_ERROR("settings menu: QUIT GAME WM_CLOSE failed with Win32 error {}", GetLastError());
+    return false;
+  }
+  REXLOG_INFO("settings menu: QUIT GAME posted WM_CLOSE to HWND {}",
+              static_cast<uint64_t>(reinterpret_cast<uintptr_t>(hwnd)));
+  return true;
+}
+#endif
+
 // True when `list` is reachable from `node` through the widget child arrays.
 // Most widgets keep children at +68; the tab strip keeps its tabs at +180.
 bool NodeReachesList(uint32_t node, uint32_t list, int depth, int& budget) {
@@ -1012,6 +1074,24 @@ bool mcla_menu_click(PPCRegister& r3, PPCRegister& r31) {
   if (!g_menus_created.load(std::memory_order_relaxed)) {
     return false;
   }
+  if (ButtonClicked(g_quit_button_key.load(std::memory_order_relaxed))) {
+    REXLOG_INFO("settings menu: QUIT GAME clicked");
+    SaveSettingsIfChanged();
+#if defined(_WIN32)
+    // The previous synthetic SDL quit event was not reliably closing the
+    // running game. Post WM_CLOSE to the real game window, as the successful
+    // automated shutdown test does; do not forcibly kill or skip teardown.
+    RequestHostWindowClose();
+#else
+    auto* runtime = rex::Runtime::instance();
+    if (auto* context = runtime ? runtime->app_context() : nullptr) {
+      context->RequestDeferredQuit();
+    }
+#endif
+    r3.u64 = 1;
+    return true;
+  }
+
   const int active = g_active_menu.load(std::memory_order_relaxed);
   if (active >= 0) {
     // Accept on a row steps its value forward. Every press inside a submenu is
@@ -1025,28 +1105,6 @@ bool mcla_menu_click(PPCRegister& r3, PPCRegister& r31) {
       ItemSetIndex(item, (ItemCurrentIndex(item) + 1) % count);
       SyncRowsFromOptions(active);
       ShowSubmenu();
-    }
-    r3.u64 = 1;
-    return true;
-  }
-
-  if (ButtonClicked(g_quit_button_key.load(std::memory_order_relaxed))) {
-    auto* runtime = rex::Runtime::instance();
-    if (auto* context = runtime ? runtime->app_context() : nullptr) {
-      REXLOG_INFO("settings menu: quit requested");
-      SaveSettingsIfChanged();
-#if defined(_WIN32)
-      // SDL's quit-event handler closes the window through OnClosing, which
-      // stops the emulation, audio and GPU threads before ending the UI loop.
-      // RequestDeferredQuit() bypasses that path and can deadlock teardown.
-      SDL_Event event{};
-      event.type = SDL_EVENT_QUIT;
-      if (!SDL_PushEvent(&event)) {
-        REXLOG_ERROR("settings menu: SDL quit event failed: {}", SDL_GetError());
-      }
-#else
-      context->RequestDeferredQuit();
-#endif
     }
     r3.u64 = 1;
     return true;
