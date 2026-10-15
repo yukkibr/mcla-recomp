@@ -150,6 +150,12 @@ try {
         Patch "sdk-patch-reflection" $sdk "$root\patches\rexglue-minmax-blend-factor.patch"
         (Get-Item "$sdk\.mcla-patched" -Force).LastWriteTime = Get-Date
     }
+    # Versioned, opt-in-on-CSV diagnostics for DX12 texture resource handling.
+    # This only adds CPU timing counters; it changes no GPU commands or cache policies.
+    if (-not (Select-String -Quiet -SimpleMatch "kTextureDescriptorCreateUs" "$sdk\include\rex\perf\counter.h")) {
+        Patch "sdk-patch-resource-timings" $sdk "$root\patches\rexglue-dx12-resource-timings.patch"
+        (Get-Item "$sdk\.mcla-patched" -Force).LastWriteTime = Get-Date
+    }
 
     # -----------------------------------------------------------------------
     Step "3/6 build and install the SDK (the long step, once)"

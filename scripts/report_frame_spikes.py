@@ -83,14 +83,19 @@ def main():
         f"P95 {pretty(percentile(frames, 95))}ms · "
         f"P99 {pretty(percentile(frames, 99))}ms · Max {pretty(max(frames))}ms",
         f"- Spikes ≥{args.slow_ms:g}ms: **{len(slow):,} ({100*len(slow)/len(source):.2f}%)**",
-        f"- Slow frames with texture cache misses: **{slow_misses}/{len(slow)}**" if slow
+        f"- Slow frames with new D3D12 SRV descriptors: **{slow_misses}/{len(slow)}**" if slow
         else "- No frame exceeded the selected spike threshold.",
-        f"- Normal frames with texture misses: {fast_misses}/{len(fast)}" if fast
+        f"- Normal frames with new SRV descriptors: {fast_misses}/{len(fast)}" if fast
         else "- No normal frames for comparison.",
         f"- Slow frames with pipeline cache misses: {slow_pipelines}/{len(slow)}" if slow
         else "- No slow frames with pipeline miss counters.",
         "",
         "These counters are correlations, not definitive attribution.",
+        "IMPORTANT: texture_cache_misses in this D3D12 SDK counts a missing "
+        "shader-resource-view (SRV) descriptor, NOT a disk or texture-data cache miss.",
+        "New *_us counters measure CPU work for resource creation, "
+        "shared-memory requests and GPU upload command preparation, "
+        "NOT GPU execution time or disk IO.",
         "Pipeline cache hits/misses do not fully describe async shader compilation.",
         "",
         "## Counters: median normal versus slow frames",
@@ -99,6 +104,9 @@ def main():
         "|---|---:|---:|",
     ]
     for key in ("draw_calls", "command_buffer_stalls", "texture_cache_misses",
+                "texture_descriptor_create_us", "texture_resource_create_us",
+                "texture_resident_request_us", "texture_upload_dispatch_us",
+                "texture_upload_requests",
                 "pipeline_cache_misses", "functions_dispatched", "interrupt_dispatches",
                 "active_threads", "buffer_queue_depth"):
         a = [r[key] for r in fast if r.get(key) is not None]
@@ -110,20 +118,26 @@ def main():
         "",
         "## Worst individual frames",
         "",
-        "| Elapsed | Frame | Draws | Texture misses | Pipeline misses | Cmd stalls |",
-        "|---:|---:|---:|---:|---:|---:|",
+        "| Elapsed | Frame | Draws | SRV misses | SRV create ms | Resource create ms | Upload prep ms | Resident request ms | Upload requests |",
+        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ])
     for f in sorted(source, key=lambda x: x["frame_ms"], reverse=True)[:args.top]:
         def n(key):
             val = f.get(key)
             return "-" if val is None else str(int(val))
+        def ms(key):
+            val = f.get(key)
+            return "-" if val is None else f"{val/1000:.2f}"
         lines.append(f"| {f['elapsed_s']:.1f}s | {f['frame_ms']:.1f}ms | "
                      f"{n('draw_calls')} | {n('texture_cache_misses')} | "
-                     f"{n('pipeline_cache_misses')} | {n('command_buffer_stalls')} |")
+                     f"{ms('texture_descriptor_create_us')} | {ms('texture_resource_create_us')} | "
+                     f"{ms('texture_upload_dispatch_us')} | {ms('texture_resident_request_us')} | "
+                     f"{n('texture_upload_requests')} |")
     lines += ["", "## What to investigate next", ""]
     if slow and slow_misses / len(slow) >= 0.6:
-        lines.append("- Texture cache misses are present in most slow frames. "
-                     "Investigate streaming/upload first; don't assume a bigger cache fixes it.")
+        lines.append("- Many slow frames create new SRV descriptors in D3D12. This is NOT "
+                     "proof of streaming misses or cache eviction. Inspect the timed "
+                     "descriptor/resource/upload counters before targeting the cause.")
     if slow and slow_pipelines / len(slow) >= 0.3:
         lines.append("- Pipeline cache misses are present in many slow frames. "
                      "Compare Auto vs 4 pipeline workers and warm/cold runs.")

@@ -23,12 +23,10 @@ The second correction uses two measures:
    `scripts/test_window_close.ps1`, including the guest / GPU / audio
    OnClosing callbacks. It never forcefully terminates the process.
 
-The game still needs a **manual in-game button test**. To capture the
-specific click and its result use `scripts/profile_gameplay.ps1`, open
-Settings, click QUIT GAME, and inspect `out/profiles/<timestamp>/game.log`
-for messages `QUIT GAME clicked` and `posted WM_CLOSE`.
-If those messages are absent, the original click-to-menu-state lookup is
-still failing and needs guest menu dispatch tracing, not another SDL change.
+**Gameplay-confirmed on 2026-10-15:** QUIT GAME was tested manually and
+worked from the pause menu; the runtime log recorded `QUIT GAME clicked`,
+`posted WM_CLOSE`, and the complete window/shutdown sequence. No further
+changes to this behavior are necessary in the performance diagnostics work.
 
 ## Performance: what is actually known
 
@@ -42,11 +40,16 @@ A subsequent real local 4-worker title test captured 80 frames above 50ms
 session, not a controlled heavy-city race. 4 workers is *not* yet validated
 as a performance improvement.
 
-This matches prior recorded gameplay observations where texture misses
-coincided with many slow frames. Enlarging the cache in an older run did NOT
-reduce misses, so indiscriminately raising memory limits is not justified.
-Some misses may reflect *first-time open-world streaming*, not eviction.
-A 2-GB cache is not a proven fix and unnecessarily raises VRAM usage.
+Later source inspection corrected the interpretation of this counter: the
+D3D12 texture_cache_misses counter is incremented when creating a new SRV
+descriptor, NOT on every texture-data cache miss or disk streaming event.
+The observed correlation does not prove upload or eviction stalls.
+Enlarging the cache in an older run did NOT reduce this descriptor counter,
+so indiscriminately raising memory limits is not justified.
+Some descriptor misses may occur while new city textures are first used,
+but their creation cost must be measured separately. A 2-GB texture cache
+is not a proven fix and unnecessarily raises VRAM usage. For direct CPU
+timing measurements, see docs/rex-dx12-resource-profiling.md.
 
 The ReXGlue D3D12 default
 `d3d12_pipeline_creation_threads=-1` starts about 3/4 of logical CPUs,

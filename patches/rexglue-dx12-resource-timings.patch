@@ -1,0 +1,215 @@
+diff --git a/include/rex/perf/counter.h b/include/rex/perf/counter.h
+--- a/include/rex/perf/counter.h
++++ b/include/rex/perf/counter.h
+@@ -48,6 +48,13 @@
+   kTextureCacheMisses,
+   kPipelineCacheHits,
+   kPipelineCacheMisses,
++
++  // Optional DX12 instrumentation: CPU command generation times, not GPU execution time.
++  kTextureDescriptorCreateUs,
++  kTextureResourceCreateUs,
++  kTextureResidentRequestUs,
++  kTextureUploadDispatchUs,
++  kTextureUploadRequests,
+ 
+   kCount  // sentinel -- must be last
+ };
+@@ -159,6 +166,11 @@
+ #define PROFILE_TEXTURE_CACHE_MISS() PERF_counter_inc(kTextureCacheMisses)
+ #define PROFILE_PIPELINE_CACHE_HIT() PERF_counter_inc(kPipelineCacheHits)
+ #define PROFILE_PIPELINE_CACHE_MISS() PERF_counter_inc(kPipelineCacheMisses)
++#define PROFILE_TEXTURE_DESCRIPTOR_CREATE_US(us) PERF_counter_add(kTextureDescriptorCreateUs, us)
++#define PROFILE_TEXTURE_RESOURCE_CREATE_US(us) PERF_counter_add(kTextureResourceCreateUs, us)
++#define PROFILE_TEXTURE_RESIDENT_REQUEST_US(us) PERF_counter_add(kTextureResidentRequestUs, us)
++#define PROFILE_TEXTURE_UPLOAD_DISPATCH_US(us) PERF_counter_add(kTextureUploadDispatchUs, us)
++#define PROFILE_TEXTURE_UPLOAD_REQUESTS(n) PERF_counter_add(kTextureUploadRequests, n)
+ 
+ #else
+ 
+@@ -184,5 +196,10 @@
+ #define PROFILE_TEXTURE_CACHE_MISS()
+ #define PROFILE_PIPELINE_CACHE_HIT()
+ #define PROFILE_PIPELINE_CACHE_MISS()
+-
+-#endif
++#define PROFILE_TEXTURE_DESCRIPTOR_CREATE_US(us)
++#define PROFILE_TEXTURE_RESOURCE_CREATE_US(us)
++#define PROFILE_TEXTURE_RESIDENT_REQUEST_US(us)
++#define PROFILE_TEXTURE_UPLOAD_DISPATCH_US(us)
++#define PROFILE_TEXTURE_UPLOAD_REQUESTS(n)
++
++#endif
+diff --git a/src/core/perf/counter.cpp b/src/core/perf/counter.cpp
+--- a/src/core/perf/counter.cpp
++++ b/src/core/perf/counter.cpp
+@@ -49,6 +49,11 @@
+     "texture_cache_misses",
+     "pipeline_cache_hits",
+     "pipeline_cache_misses",
++    "texture_descriptor_create_us",
++    "texture_resource_create_us",
++    "texture_resident_request_us",
++    "texture_upload_dispatch_us",
++    "texture_upload_requests",
+ };
+ static_assert(std::size(kCounterNames) == kNumCounters, "kCounterNames must match CounterId enum");
+ 
+@@ -72,6 +77,11 @@
+     false,  // kTextureCacheMisses
+     false,  // kPipelineCacheHits
+     false,  // kPipelineCacheMisses
++    false,  // kTextureDescriptorCreateUs
++    false,  // kTextureResourceCreateUs
++    false,  // kTextureResidentRequestUs
++    false,  // kTextureUploadDispatchUs
++    false,  // kTextureUploadRequests
+ };
+ static_assert(std::size(kIsGauge) == kNumCounters, "kIsGauge must match CounterId enum");
+ 
+diff --git a/src/graphics/d3d12/texture_cache.cpp b/src/graphics/d3d12/texture_cache.cpp
+--- a/src/graphics/d3d12/texture_cache.cpp
++++ b/src/graphics/d3d12/texture_cache.cpp
+@@ -11,6 +11,8 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <chrono>
++#include <cstdlib>
+ #include <cfloat>
+ #include <cstddef>
+ #include <cstring>
+@@ -1549,11 +1551,24 @@
+   // Assuming untiling will be the next operation.
+   D3D12_RESOURCE_STATES resource_state = D3D12_RESOURCE_STATE_COPY_DEST;
+   Microsoft::WRL::ComPtr<ID3D12Resource> resource;
++#ifdef REXGLUE_ENABLE_PERF_COUNTERS
++  static const bool profile_allocations = std::getenv("REX_PERF_LOG_CSV") != nullptr;
++  const auto resource_start =
++      profile_allocations ? std::chrono::steady_clock::now()
++                          : std::chrono::steady_clock::time_point{};
++#endif
+   if (FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesDefault,
+                                              provider.GetHeapFlagCreateNotZeroed(), &desc,
+                                              resource_state, nullptr, IID_PPV_ARGS(&resource)))) {
+     return nullptr;
+   }
++#ifdef REXGLUE_ENABLE_PERF_COUNTERS
++  if (profile_allocations) {
++    PROFILE_TEXTURE_RESOURCE_CREATE_US(
++        std::chrono::duration_cast<std::chrono::microseconds>(
++            std::chrono::steady_clock::now() - resource_start).count());
++  }
++#endif
+   return std::unique_ptr<Texture>(new D3D12Texture(*this, key, resource.Get(), resource_state));
+ }
+ 
+@@ -2049,6 +2064,14 @@
+     return existing_descriptor_index;
+   }
+   PROFILE_TEXTURE_CACHE_MISS();
++#ifdef REXGLUE_ENABLE_PERF_COUNTERS
++  // Instrument CPU creation of a missing SRV; this existing 'texture cache
++  // miss' counter is about descriptors, not a disk/texture-streaming miss.
++  static const bool profile_descriptors = std::getenv("REX_PERF_LOG_CSV") != nullptr;
++  const auto descriptor_start =
++      profile_descriptors ? std::chrono::steady_clock::now()
++                          : std::chrono::steady_clock::time_point{};
++#endif
+ 
+   TextureKey texture_key = texture.key();
+ 
+@@ -2165,6 +2188,13 @@
+   device->CreateShaderResourceView(resource_for_view, &desc,
+                                    GetTextureDescriptorCPUHandle(descriptor_index));
+   texture.AddSRVDescriptorIndex(descriptor_key, descriptor_index);
++#ifdef REXGLUE_ENABLE_PERF_COUNTERS
++  if (profile_descriptors) {
++    PROFILE_TEXTURE_DESCRIPTOR_CREATE_US(
++        std::chrono::duration_cast<std::chrono::microseconds>(
++            std::chrono::steady_clock::now() - descriptor_start).count());
++  }
++#endif
+   return descriptor_index;
+ }
+ 
+diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
+--- a/src/graphics/pipeline/texture/cache.cpp
++++ b/src/graphics/pipeline/texture/cache.cpp
+@@ -10,6 +10,8 @@
+  */
+ 
+ #include <algorithm>
++#include <chrono>
++#include <cstdlib>
+ #include <cstdint>
+ #include <utility>
+ 
+@@ -25,6 +27,7 @@
+ #include <rex/graphics/xenos.h>
+ #include <rex/logging.h>
+ #include <rex/math.h>
++#include <rex/perf/counter.h>
+ 
+ REXCVAR_DEFINE_INT32(texture_cache_memory_limit_render_to_texture, 24, "GPU",
+                      "Texture cache memory limit for render-to-texture (MB)")
+@@ -435,8 +438,23 @@
+     }
+   }
+ 
+-  if (!LoadTextureDataFromResidentMemoryImpl(texture, pending_load.load_base,
+-                                             pending_load.load_mips)) {
++#ifdef REXGLUE_ENABLE_PERF_COUNTERS
++  static const bool profile_uploads = std::getenv("REX_PERF_LOG_CSV") != nullptr;
++  const auto upload_start =
++      profile_uploads ? std::chrono::steady_clock::now()
++                      : std::chrono::steady_clock::time_point{};
++#endif
++  const bool upload_submitted =
++      LoadTextureDataFromResidentMemoryImpl(texture, pending_load.load_base,
++                                            pending_load.load_mips);
++#ifdef REXGLUE_ENABLE_PERF_COUNTERS
++  if (profile_uploads) {
++    PROFILE_TEXTURE_UPLOAD_DISPATCH_US(
++        std::chrono::duration_cast<std::chrono::microseconds>(
++            std::chrono::steady_clock::now() - upload_start).count());
++  }
++#endif
++  if (!upload_submitted) {
+     return false;
+   }
+ 
+@@ -561,6 +579,12 @@
+     }
+   }
+ 
++#ifdef REXGLUE_ENABLE_PERF_COUNTERS
++  static const bool profile_texture_requests = std::getenv("REX_PERF_LOG_CSV") != nullptr;
++  if (profile_texture_requests) {
++    PROFILE_TEXTURE_UPLOAD_REQUESTS(static_cast<int64_t>(pending_texture_loads.size()));
++  }
++#endif
+   COUNT_profile_set("gpu/texture_cache/request_textures_pending_load_count",
+                     uint32_t(pending_texture_loads.size()));
+   COUNT_profile_set("gpu/texture_cache/request_textures_pending_range_count",
+@@ -573,8 +597,20 @@
+     for (const PendingSharedMemoryRange& pending_range : pending_shared_memory_ranges) {
+       pending_shared_memory_range_pairs.emplace_back(pending_range.start, pending_range.length);
+     }
++#ifdef REXGLUE_ENABLE_PERF_COUNTERS
++    const auto request_start =
++        profile_texture_requests ? std::chrono::steady_clock::now()
++                                 : std::chrono::steady_clock::time_point{};
++#endif
+     batched_shared_memory_request_succeeded = shared_memory().RequestRanges(
+         pending_shared_memory_range_pairs.data(), pending_shared_memory_range_pairs.size());
++#ifdef REXGLUE_ENABLE_PERF_COUNTERS
++    if (profile_texture_requests) {
++      PROFILE_TEXTURE_RESIDENT_REQUEST_US(
++          std::chrono::duration_cast<std::chrono::microseconds>(
++              std::chrono::steady_clock::now() - request_start).count());
++    }
++#endif
+   }
+ 
+   if (batched_shared_memory_request_succeeded) {

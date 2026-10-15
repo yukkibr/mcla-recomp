@@ -18,12 +18,13 @@ so these are NOT controlled A/B measurements):
 | P99 frametime | 74.9 ms | 86.9 ms |
 | Worst frame | 647.0 ms | 214.2 ms |
 | Frames over 50 ms | 991 (6.82%) | 885 (13.23%) |
-| Slow frames with texture misses | 582 / 991 | 558 / 885 |
+| Slow frames with newly created SRV descriptors | 582 / 991 | 558 / 885 |
 
 The capped run confirms the remaining performance problem: in dense
-scenes it cannot sustain 30 FPS. Texture cache misses are associated
-with many spikes, but some of the worst ones have no texture miss at all.
-The ReXGlue CPU draw-call and texture streaming issues remain unsolved.
+scenes it cannot sustain 30 FPS. New SRV descriptor creation is associated
+with many spikes, but it is not proof of texture upload or disk streaming.
+Some of the worst frames have no descriptor misses at all. ReXGlue CPU draw
+translation and resource synchronization still require direct measurements.
 
 ## Important frame-timing detail
 
