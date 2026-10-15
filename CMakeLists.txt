@@ -41,6 +41,13 @@ if(WIN32 AND MCLA_ENABLE_FIDELITYFX_MENU)
     target_compile_definitions(mcla PRIVATE MCLA_FIDELITYFX_MENU=1)
 endif()
 
+# The fast SDK build compiles out rex::perf::GetSnapshotCounter entirely.
+# Guard the game's development-only A/B draw counter on this build mode.
+option(MCLA_REX_PERF_COUNTERS "SDK has the ReXGlue performance snapshot API" OFF)
+if(MCLA_REX_PERF_COUNTERS)
+    target_compile_definitions(mcla PRIVATE MCLA_HAS_REX_PERF_COUNTERS=1)
+endif()
+
 if(WIN32)
     # timeBeginPeriod for the frame limiter.
     target_link_libraries(mcla PRIVATE winmm)

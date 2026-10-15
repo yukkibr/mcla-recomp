@@ -253,7 +253,9 @@ void TickAbTest() {
     State& state = states[reduced ? 1 : 0];
     ++state.frames;
     state.micros += now - last_frame;
+#if defined(MCLA_HAS_REX_PERF_COUNTERS)
     state.draws += uint64_t(rex::perf::GetSnapshotCounter(rex::perf::CounterId::kDrawCalls));
+#endif
   }
   last_frame = now;
   if (now - switched_at > 4'000'000) {

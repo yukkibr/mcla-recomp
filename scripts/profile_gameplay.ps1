@@ -10,6 +10,14 @@ param(
 $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot -Parent
 $build = Join-Path $root "out\build\win-amd64-release"
+$perfModeFile = Join-Path $root "third_party\rexglue-sdk\out\install\win-amd64\.mcla-perf-counters-mode"
+if ((Test-Path $perfModeFile) -and
+    (Get-Content -LiteralPath $perfModeFile -Raw).Trim() -ne "ON") {
+    throw ("This is a FAST PLAY build without ReXGlue CSV counters. " +
+           "To record per-frame data, run .\scripts\make_pc.ps1 -FidelityFX -ProfileCounters, " +
+           "then rerun this capture. To restore the fast runtime later, " +
+           "run .\scripts\make_pc.ps1 -FidelityFX.")
+}
 if (Get-Process mcla -ErrorAction SilentlyContinue) {
     throw "Close any existing MCLA instance first to avoid overlapping sessions"
 }

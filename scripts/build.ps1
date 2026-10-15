@@ -1,5 +1,6 @@
 # Regenerate code from the user's XEX and build.  Usage: .\scripts\build.ps1 [-Preset win-amd64-release]
-param([string]$Preset = "win-amd64-release", [switch]$NoCodegen, [switch]$FidelityFX)
+param([string]$Preset = "win-amd64-release", [switch]$NoCodegen,
+      [switch]$FidelityFX, [switch]$ProfileCounters)
 . "$PSScriptRoot\env.ps1"
 $root = Split-Path $PSScriptRoot -Parent
 # Windows PowerShell 5.1 turns a program's redirected stderr into errors, which
@@ -14,11 +15,16 @@ try {
         Select-String -Path "$root\out\codegen.log" -Pattern "Codegen summary" | ForEach-Object { $_.Line }
     }
     $fxMode = if ($FidelityFX) { "ON" } else { "OFF" }
+    $counterMode = if ($ProfileCounters) { "ON" } else { "OFF" }
     $cache = "$root\out\build\$Preset\CMakeCache.txt"
-    $expected = "MCLA_ENABLE_FIDELITYFX_MENU:BOOL=$fxMode"
-    $current = if (Test-Path $cache) { Select-String -Path $cache -SimpleMatch -Quiet $expected } else { $false }
+    $expectedFx = "MCLA_ENABLE_FIDELITYFX_MENU:BOOL=$fxMode"
+    $expectedCounters = "MCLA_REX_PERF_COUNTERS:BOOL=$counterMode"
+    $current = if (Test-Path $cache) {
+        (Select-String -Path $cache -SimpleMatch -Quiet $expectedFx) -and
+        (Select-String -Path $cache -SimpleMatch -Quiet $expectedCounters)
+    } else { $false }
     if (-not (Test-Path "$root\out\build\$Preset\build.ninja") -or -not $current) {
-        cmake --preset $Preset "-DCMAKE_PREFIX_PATH=$env:REXSDK" "-DMCLA_ENABLE_FIDELITYFX_MENU=$fxMode" 2>&1 | ForEach-Object { "$_" } > "$root\out\configure.log"
+        cmake --preset $Preset "-DCMAKE_PREFIX_PATH=$env:REXSDK" "-DMCLA_ENABLE_FIDELITYFX_MENU=$fxMode" "-DMCLA_REX_PERF_COUNTERS=$counterMode" 2>&1 | ForEach-Object { "$_" } > "$root\out\configure.log"
         if ($LASTEXITCODE -ne 0) { Get-Content "$root\out\configure.log" | Select-Object -Last 20; throw "configure failed" }
     }
     cmake --build --preset $Preset 2>&1 | ForEach-Object { "$_" } > "$root\out\build.log"
