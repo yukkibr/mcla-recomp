@@ -32,16 +32,24 @@ unless this switch was used at build time.
 
 ## In-game DISPLAY menu (Windows)
 
-- DRAW SCALE (NEXT START): 1X (original) or experimental 2X. This scales
-  the actual Xenos draw targets UP (roughly 720p -> 1440p at 2X); GPU cost
-  and VRAM usage may increase. It is not a way to render below 720p.
+- RENDER QUALITY (NEXT START): NATIVE 720P (1280x720), QUALITY 630P
+  (1120x630), BALANCED 540P (960x540), PERFORMANCE 480P (854x480).
+  These change the Xbox 360 guest video mode and native Xenos render target,
+  then spatial FSR1 can reconstruct the smaller output for a larger window.
+  Requires restart, and does not guarantee higher FPS where CPU-bound.
+- DRAW SCALE (NEXT START): 1X or experimental 2X. This is supersampling
+  and is separate from render quality; use 1X when seeking performance.
 - UPSCALER (NEXT START): NATIVE (BILINEAR), AMD CAS, AMD FSR 1.
 - FSR SOFTENING (NEXT START): 0.0, 0.2 (ReXGlue default), 0.5, 1.0, 2.0.
   Larger values mean less RCAS sharpening.
 - These use ReXGlue's existing `present_effect` and
   `present_fsr_sharpness_reduction` CVars. Settings save to `mcla.toml`.
   **Restart the game** after changing the present effect.
-- The new rows are excluded from the PS5 menu.
+- The new render and FidelityFX rows are excluded from the PS5 menu.
+- For dense areas, the PERFORMANCE tab now also provides CITY PRESET options
+  (Standard, Balanced, Performance, Minimum, or Custom). These reduce
+  traffic distance/density, parked cars, LOD and shadows. See
+  `docs/phase2-render-tests.md` for exact values and validation.
 
 Equivalent command-line usage (D3D12 only):
 
@@ -57,19 +65,19 @@ same window width and height. For spatial sharpening only use `cas`.
 1. This is **spatial FSR 1**, not temporal FSR 3.1, FSR 4.1 or DLSS.
    The experimental ReXGlue FSR2/3 code synthesizes depth/motion inputs;
    do not enable it or market it as high-fidelity temporal reconstruction.
-2. The game commonly outputs a 1280x720 guest frontbuffer; the spatial effect
-   sharpens/upscales the final output when the window/display is larger.
-   This change **does not lower the 3D internal render resolution**. It does
-   not promise higher FPS (the Phase 1 tests were likely CPU/translation limited).
-3. ReXGlue's `resolution_scale` currently accepts integers 1..8 **only for
-   increasing draw resolution**, not percentages below 100%. The menu exposes
-   1X and experimental 2X; a short startup smoke test at 2X succeeded, but
-   full gameplay, HUD/post-processing and race handling remain unverified.
-   Do not create a fake Quality/Balanced/Performance menu until a correct
-   fractional 3D renderer is available (render targets, viewport/resolve
-   coordinates, and post-processing). Temporal FSR2/3 quality modes do not
-   mean FSR1 will render the original game at those scales.
+2. The new render quality modes request smaller Xbox guest video modes.
+   GPU instrumentation verified changes in the created frontbuffer and
+   Xenos render-target width (1280 at native, 960 at 540p, 854 at 480p).
+   Not every shader, post-process or auxiliary target is guaranteed to scale.
+   The 360p experiment produced black images in short test captures and
+   wasn't validated in gameplay, so it is not exposed.
+3. ReXGlue's `resolution_scale` still only accepts integer supersampling
+   multipliers; it is NOT the lower-render-resolution control. Quality,
+   Balanced and Performance are fork-specific guest video mode presets, not
+   AMD-provided FSR 2/3/4 algorithms. Dense locations may be CPU-limited.
 4. Test title screen, gameplay, UI/HUD, shadows, bloom, garage and rain.
+   The title/splash screen was visually tested for 540p/480p. Test complete
+   races manually before judging low-resolution profiles as game-ready.
    For performance compare the same actual in-race route and camera.
 5. Windows D3D12 has been targeted here; Vulkan/PS5 FSR runtime parity is
    intentionally not claimed.

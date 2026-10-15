@@ -194,6 +194,7 @@ try {
     $build = "$root\out\build\$Preset"
     if (-not (Test-Path "$build\mcla.exe")) { Fail "mcla.exe was not built (log: $root\out\build.log)" }
     Copy-Item "$install\bin\rexgpu-xenos.dll" $build -Force
+    Copy-Item "$install\bin\rexruntime.dll" $build -Force
     if ($FidelityFX) {
         $fxDll = "$install\bin\amd_fidelityfx_dx12.dll"
         if (-not (Test-Path -LiteralPath $fxDll)) { Fail "FidelityFX DLL missing: $fxDll" }

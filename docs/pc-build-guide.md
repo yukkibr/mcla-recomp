@@ -42,7 +42,9 @@ compile and package ReXGlue's FidelityFX DX12 integration.
 This exposes NATIVE/BILINEAR, CAS and spatial FSR1 in the in-game DISPLAY menu,
 plus an optional 2X draw scale (the latter increases GPU work). Do not confuse
 this with FSR3/FSR4/DLSS or reduced internal 3D resolution. Read
-`docs/phase2-fidelityfx.md` for build requirements and limitations.
+`docs/phase2-fidelityfx.md` and `docs/phase2-render-tests.md` for build
+requirements, lower guest video mode presets, the CITY PRESET performance
+options and the clean-exit fix.
 
 1. Checks that the tools are installed, and installs the missing ones if you agree.
 2. Clones the ReXGlue SDK v0.10.0 into `third_party\rexglue-sdk`, applies this project's patches and makes the one Windows-specific repair the checkout needs.

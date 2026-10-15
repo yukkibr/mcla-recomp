@@ -17,6 +17,7 @@ REXCVAR_DEFINE_STRING(mcla_gpu_backend, "any", "MCLA",
 
 std::unique_ptr<rex::system::IAudioSystem> CreateMclaAudioSystem(
     rex::runtime::FunctionDispatcher* function_dispatcher);
+void MclaApplyGuestRenderPreset();
 
 // Started with no options (a double-click on mcla.exe), the game should just
 // run: find the extracted game next to the executable or, as the build leaves
@@ -40,6 +41,7 @@ void MclaApp::OnConfigurePaths(rex::PathConfig& paths) {
 }
 
 void MclaApp::OnPreSetup(rex::RuntimeConfig& config) {
+  MclaApplyGuestRenderPreset();
   config.audio_factory = &CreateMclaAudioSystem;
   if (config.gpu_plugin.empty()) {
     config.gpu_plugin = "xenos";

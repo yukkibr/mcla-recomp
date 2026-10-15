@@ -30,10 +30,50 @@
 #include <rex/system/function_dispatcher.h>
 #include <rex/ui/windowed_app_context.h>
 
+#if defined(_WIN32)
+#include <SDL3/SDL_events.h>
+#endif
+
 REXCVAR_DEFINE_BOOL(mcla_motion_blur, true, "MCLA", "Motion blur");
 REXCVAR_DEFINE_BOOL(mcla_depth_of_field, true, "MCLA", "Depth of field blur");
+#if !REX_PLATFORM_PS5
+REXCVAR_DEFINE_STRING(mcla_render_quality, "native", "MCLA",
+                      "Experimental guest render video mode: native (720p), quality (630p), "
+                      "balanced (540p), performance (480p). Restart required.")
+    .allowed({"native", "quality", "balanced", "performance"})
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+#endif
+
+// Runs during MclaApp::OnPreSetup, before the emulated Xbox GPU is initialized.
+// This requests smaller guest render targets, unlike post-render downsampling.
+void MclaApplyGuestRenderPreset() {
+#if !REX_PLATFORM_PS5
+  const std::string choice = REXCVAR_GET(mcla_render_quality);
+  if (choice == "native" && !rex::cvar::HasNonDefaultValue("mcla_render_quality")) {
+    return;  // Keep command-line guest video mode overrides when no preset is chosen.
+  }
+  int width = 1280, height = 720;
+  if (choice == "quality") {
+    width = 1120;
+    height = 630;
+  } else if (choice == "balanced") {
+    width = 960;
+    height = 540;
+  } else if (choice == "performance") {
+    width = 854;
+    height = 480;
+  }
+  rex::cvar::SetFlagByName("video_mode_width", std::to_string(width));
+  rex::cvar::SetFlagByName("video_mode_height", std::to_string(height));
+  REXLOG_INFO("MCLA guest render mode: {} ({}x{}), restart-only", choice, width, height);
+#endif
+}
+
 REXCVAR_DEFINE_BOOL(mcla_settings_menu, true, "MCLA",
                     "Add the settings submenus to the pause menu");
+REXCVAR_DEFINE_STRING(mcla_city_profile, "custom", "MCLA",
+                      "City detail preset: custom, standard, balanced, performance, minimum")
+    .allowed({"custom", "standard", "balanced", "performance", "minimum"});
 
 // Set by a host that keeps the settings file somewhere other than next to
 // the executable (PS5).
@@ -339,9 +379,46 @@ std::string OptionGet(const char* name) {
   return rex::cvar::GetFlagByName(name);
 }
 
+void ApplyCityProfile(const char* name) {
+  // Apply existing guest engine performance controls as a coherent preset.
+  if (std::strcmp(name, "custom") == 0) {
+    return;
+  }
+  const bool standard = std::strcmp(name, "standard") == 0;
+  const bool balanced = std::strcmp(name, "balanced") == 0;
+  const bool minimum = std::strcmp(name, "minimum") == 0;
+  auto set = [](const char* flag, const char* value) {
+    rex::cvar::SetFlagByName(flag, value);
+  };
+  set("mcla_city_lod", standard ? "1" : balanced ? "0.75" : "0.5");
+  set("mcla_traffic_lod", standard ? "1" : balanced ? "0.75" : "0.5");
+  set("mcla_traffic_distance", standard ? "400" : balanced ? "325" : "250");
+  set("mcla_pedestrians", standard ? "1" : minimum ? "0" : "0.5");
+  set("mcla_parked_cars", standard ? "1" : balanced ? "0.5" : "0");
+  set("mcla_shadows", standard || balanced ? "true" : "false");
+  set("mcla_foliage_shadows", standard ? "true" : "false");
+  REXLOG_INFO("settings menu: city profile {} applied (some options need city reload)", name);
+}
+
+bool IsCityProfileControl(const char* name) {
+  return std::strcmp(name, "mcla_city_lod") == 0 ||
+         std::strcmp(name, "mcla_traffic_lod") == 0 ||
+         std::strcmp(name, "mcla_traffic_distance") == 0 ||
+         std::strcmp(name, "mcla_pedestrians") == 0 ||
+         std::strcmp(name, "mcla_parked_cars") == 0 ||
+         std::strcmp(name, "mcla_shadows") == 0 ||
+         std::strcmp(name, "mcla_foliage_shadows") == 0;
+}
+
 void OptionSet(const char* name, const char* value) {
   REXLOG_INFO("settings menu: {} = {}", name, value);
   rex::cvar::SetFlagByName(name, value);
+  if (std::strcmp(name, "mcla_city_profile") == 0) {
+    ApplyCityProfile(value);
+  } else if (IsCityProfileControl(name)) {
+    // Individual adjustments return the preset to CUSTOM.
+    rex::cvar::SetFlagByName("mcla_city_profile", "custom");
+  }
 }
 
 enum class ItemKind { kToggle, kStringChoice, kNumberChoice };
@@ -387,6 +464,9 @@ constexpr double kDrawScales[] = {1.0, 2.0};
 // Requires an SDK compiled with REXGLUE_ENABLE_FIDELITYFX=ON.
 constexpr const char* kUpscaleEffects[] = {"bilinear", "cas", "fsr"};
 constexpr const char* kUpscaleLabels[] = {"NATIVE (BILINEAR)", "AMD CAS", "AMD FSR 1"};
+constexpr const char* kRenderPresets[] = {"native", "quality", "balanced", "performance"};
+constexpr const char* kRenderPresetLabels[] = {"NATIVE 720P", "QUALITY 630P", "BALANCED 540P",
+                                              "PERFORMANCE 480P"};
 constexpr double kFsrSharpnessReduction[] = {0.0, 0.2, 0.5, 1.0, 2.0};
 #endif
 
@@ -401,6 +481,8 @@ const ItemDef kDisplayItems[] = {
     {"PM_MxDrawScale", ItemKind::kNumberChoice, "resolution_scale",
      "DRAW SCALE (NEXT START)", nullptr, nullptr, kDrawScales, 2, "%.0fX"},
 #if defined(MCLA_FIDELITYFX_MENU)
+    {"PM_MxRenderQuality", ItemKind::kStringChoice, "mcla_render_quality",
+     "RENDER QUALITY (NEXT START)", kRenderPresets, kRenderPresetLabels, nullptr, 4},
     {"PM_MxUpscale", ItemKind::kStringChoice, "present_effect", "UPSCALER (NEXT START)",
      kUpscaleEffects, kUpscaleLabels, nullptr, 3},
     {"PM_MxFsrSharp", ItemKind::kNumberChoice, "present_fsr_sharpness_reduction",
@@ -417,8 +499,12 @@ const ItemDef kDisplayItems[] = {
 constexpr double kDetailScales[] = {0.5, 0.75, 1.0};
 constexpr double kDensityScales[] = {0.0, 0.5, 1.0};
 constexpr double kTrafficDistances[] = {250.0, 325.0, 400.0};
+constexpr const char* kCityProfileValues[] = {"custom", "standard", "balanced", "performance", "minimum"};
+constexpr const char* kCityProfileLabels[] = {"CUSTOM", "STANDARD", "BALANCED", "PERFORMANCE", "MINIMUM"};
 
 const ItemDef kPerformanceItems[] = {
+    {"PM_MxCityProfile", ItemKind::kStringChoice, "mcla_city_profile",
+     "CITY PRESET", kCityProfileValues, kCityProfileLabels, nullptr, 5},
     {"PM_MxSingleTile", ItemKind::kToggle, "mcla_single_tile", "SINGLE TILE RENDERING"},
     {"PM_MxFenceYield", ItemKind::kToggle, "mcla_fence_yield", "GPU WAIT YIELD"},
     {"PM_MxShadows", ItemKind::kToggle, "mcla_shadows", "SHADOWS"},
@@ -949,7 +1035,18 @@ bool mcla_menu_click(PPCRegister& r3, PPCRegister& r31) {
     if (auto* context = runtime ? runtime->app_context() : nullptr) {
       REXLOG_INFO("settings menu: quit requested");
       SaveSettingsIfChanged();
+#if defined(_WIN32)
+      // SDL's quit-event handler closes the window through OnClosing, which
+      // stops the emulation, audio and GPU threads before ending the UI loop.
+      // RequestDeferredQuit() bypasses that path and can deadlock teardown.
+      SDL_Event event{};
+      event.type = SDL_EVENT_QUIT;
+      if (!SDL_PushEvent(&event)) {
+        REXLOG_ERROR("settings menu: SDL quit event failed: {}", SDL_GetError());
+      }
+#else
       context->RequestDeferredQuit();
+#endif
     }
     r3.u64 = 1;
     return true;
