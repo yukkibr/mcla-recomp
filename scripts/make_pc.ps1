@@ -159,6 +159,11 @@ try {
         Patch "sdk-patch-resource-timings" $sdk "$root\patches\rexglue-dx12-resource-timings.patch"
         (Get-Item "$sdk\.mcla-patched" -Force).LastWriteTime = Get-Date
     }
+    # CPU-side D3D12 scissor decoding cache (runtime opt-in, default OFF).
+    if (-not (Select-String -Quiet -SimpleMatch "scissor_cache_hits_" "$sdk\include\rex\graphics\d3d12\command_processor.h")) {
+        Patch "sdk-patch-scissor-cache" $sdk "$root\patches\rexglue-dx12-scissor-cache.patch"
+        (Get-Item "$sdk\.mcla-patched" -Force).LastWriteTime = Get-Date
+    }
     # Opt-in bounded D3D12 resource reuse pool, disabled by default.
     if (-not (Select-String -Quiet -SimpleMatch "resource_pool_limit_bytes_" "$sdk\include\rex\graphics\d3d12\texture_cache.h")) {
         Patch "sdk-patch-resource-pool" $sdk "$root\patches\rexglue-dx12-resource-pool.patch"
