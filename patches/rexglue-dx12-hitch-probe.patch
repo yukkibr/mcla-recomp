@@ -1,0 +1,223 @@
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -10,6 +10,8 @@
+  */
+ 
+ #include <algorithm>
++#include <array>
++#include <chrono>
+ #include <cstdarg>
+ #include <cstring>
+ #include <sstream>
+@@ -43,6 +45,10 @@
+                     "Verify every 2048th cached scissor against the original decoder")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
++REXCVAR_DEFINE_BOOL(d3d12_hitch_probe, false, "GPU/D3D12",
++                    "Diagnose CPU-side draw, texture, pipeline, GPU fence and frame submission times")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ REXCVAR_DEFINE_BOOL(d3d12_readback_memexport, false, "GPU/D3D12",
+                     "Read data written by memory export in shaders on the CPU")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+@@ -56,6 +62,96 @@
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
+ namespace rex::graphics::d3d12 {
++
++// Optional lightweight CPU timing of the D3D12 GPU Commands thread. These
++// counts DO NOT measure hardware GPU execution time, do not synchronize GPU,
++// and never modify rendering or guest memory.
++namespace {
++enum class HitchPart : uint32_t {
++  kDraw,
++  kRenderTargets,
++  kPipeline,
++  kTextures,
++  kBindings,
++  kFence,
++  kSubmission,
++  kSwap,
++  kCount
++};
++constexpr size_t kHitchPartCount = size_t(HitchPart::kCount);
++using HitchClock = std::chrono::steady_clock;
++struct HitchFrame {
++  std::array<uint64_t, kHitchPartCount> us{};
++  std::array<uint64_t, kHitchPartCount> peak_us{};
++  std::array<uint64_t, kHitchPartCount> calls{};
++  uint64_t frame_count = 0;
++  HitchClock::time_point previous_swap{};
++  uint32_t frames_since_report = 0;
++};
++thread_local HitchFrame hitch_frame{};
++
++struct HitchScope {
++  HitchPart part;
++  bool enabled;
++  HitchClock::time_point start;
++  explicit HitchScope(HitchPart what) : part(what), enabled(REXCVAR_GET(d3d12_hitch_probe)) {
++    if (enabled) start = HitchClock::now();
++  }
++  ~HitchScope() {
++    if (!enabled) return;
++    const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
++        HitchClock::now() - start).count();
++    const auto idx = size_t(part);
++    const uint64_t us = uint64_t(std::max<int64_t>(0, elapsed));
++    hitch_frame.us[idx] += us;
++    hitch_frame.peak_us[idx] = std::max(hitch_frame.peak_us[idx], us);
++    ++hitch_frame.calls[idx];
++  }
++};
++
++void HitchReportBeforeSwap() {
++  if (!REXCVAR_GET(d3d12_hitch_probe)) {
++    hitch_frame = {};
++    return;
++  }
++  auto now = HitchClock::now();
++  if (hitch_frame.previous_swap == HitchClock::time_point{}) {
++    hitch_frame.previous_swap = now;
++    return;
++  }
++  const auto interval_us = std::chrono::duration_cast<std::chrono::microseconds>(
++      now - hitch_frame.previous_swap).count();
++  hitch_frame.previous_swap = now;
++  const auto& sum = hitch_frame.us;
++  const auto& calls = hitch_frame.calls;
++  const auto& peak = hitch_frame.peak_us;
++  const auto get = [&](HitchPart p) { return double(sum[size_t(p)]) / 1000.0; };
++  const auto count = [&](HitchPart p) { return calls[size_t(p)]; };
++  ++hitch_frame.frames_since_report;
++  const bool hitch = interval_us >= 50000;
++  if (hitch || hitch_frame.frames_since_report >= 180) {
++    REXGPU_INFO(
++        "DX12 hitch probe: GPU-thread swap interval {:.1f}ms | draws {} "
++        "cpu {:.1f}ms (max single {:.2f}ms), rt {:.1f}ms, "
++        "pipeline {:.1f}ms, texture {:.1f}ms, bindings {:.1f}ms, "
++        "fence {:.1f}ms (max {:.1f}ms), submits {} cpu {:.1f}ms, "
++        "swap {:.1f}ms, overlap=yes",
++        double(interval_us) / 1000.0, count(HitchPart::kDraw), get(HitchPart::kDraw),
++        double(peak[size_t(HitchPart::kDraw)]) / 1000.0,
++        get(HitchPart::kRenderTargets), get(HitchPart::kPipeline),
++        get(HitchPart::kTextures), get(HitchPart::kBindings),
++        get(HitchPart::kFence), double(peak[size_t(HitchPart::kFence)]) / 1000.0,
++        count(HitchPart::kSubmission), get(HitchPart::kSubmission),
++        get(HitchPart::kSwap));
++    hitch_frame.frames_since_report = 0;
++  }
++  // Nested categories deliberately overlap (draw includes RT, pipeline,
++  // textures, bindings). Do not add all category times as a frame total.
++  hitch_frame.us.fill(0);
++  hitch_frame.peak_us.fill(0);
++  hitch_frame.calls.fill(0);
++}
++}  // namespace
+ 
+ // Generated with `xb buildshaders`.
+ namespace shaders {
+@@ -1902,6 +1998,8 @@
+ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
+                                       uint32_t frontbuffer_height) {
+   SCOPE_profile_cpu_f("gpu");
++  HitchReportBeforeSwap();
++  HitchScope hitch_swap(HitchPart::kSwap);
+   vertex_buffers_in_sync_[0] = 0;
+   vertex_buffers_in_sync_[1] = 0;
+ 
+@@ -2279,6 +2377,7 @@
+ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint32_t index_count,
+                                       IndexBufferInfo* index_buffer_info,
+                                       bool major_mode_explicit) {
++  HitchScope hitch_draw(HitchPart::kDraw);
+ #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+@@ -2372,8 +2471,14 @@
+   uint32_t normalized_color_mask =
+       pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
+                    : 0;
+-  if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
+-                                    normalized_color_mask, *vertex_shader)) {
++  bool render_target_ready;
++  {
++    HitchScope hitch_rt(HitchPart::kRenderTargets);
++    render_target_ready = render_target_cache_->Update(
++        is_rasterization_done, normalized_depth_control,
++        normalized_color_mask, *vertex_shader);
++  }
++  if (!render_target_ready) {
+     return false;
+   }
+ 
+@@ -2400,10 +2505,15 @@
+   }
+   void* pipeline_handle;
+   ID3D12RootSignature* root_signature;
+-  if (!pipeline_cache_->ConfigurePipeline(
+-          vertex_shader_translation, pixel_shader_translation, primitive_processing_result,
+-          normalized_depth_control, normalized_color_mask, bound_depth_and_color_render_target_bits,
+-          bound_depth_and_color_render_target_formats, &pipeline_handle, &root_signature)) {
++  bool pipeline_ready;
++  {
++    HitchScope hitch_pipeline(HitchPart::kPipeline);
++    pipeline_ready = pipeline_cache_->ConfigurePipeline(
++        vertex_shader_translation, pixel_shader_translation, primitive_processing_result,
++        normalized_depth_control, normalized_color_mask, bound_depth_and_color_render_target_bits,
++        bound_depth_and_color_render_target_formats, &pipeline_handle, &root_signature);
++  }
++  if (!pipeline_ready) {
+     return false;
+   }
+   if (REXCVAR_GET(async_shader_compilation) &&
+@@ -2415,7 +2525,10 @@
+   uint32_t used_texture_mask =
+       vertex_shader->GetUsedTextureMaskAfterTranslation() |
+       (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
+-  texture_cache_->RequestTextures(used_texture_mask);
++  {
++    HitchScope hitch_textures(HitchPart::kTextures);
++    texture_cache_->RequestTextures(used_texture_mask);
++  }
+ 
+   // Bind the pipeline after configuring it and doing everything that may bind
+   // other pipelines.
+@@ -2535,7 +2648,13 @@
+                              used_texture_mask, normalized_depth_control, normalized_color_mask);
+ 
+   // Update constant buffers, descriptors and root parameters.
+-  if (!UpdateBindings(vertex_shader, pixel_shader, root_signature, memexport_used)) {
++  bool bindings_ready;
++  {
++    HitchScope hitch_bindings(HitchPart::kBindings);
++    bindings_ready = UpdateBindings(
++        vertex_shader, pixel_shader, root_signature, memexport_used);
++  }
++  if (!bindings_ready) {
+     return false;
+   }
+   // Must not call anything that can change the descriptor heap from now on!
+@@ -3342,8 +3461,11 @@
+   // Check the fence - needed for all kinds of submissions (to reclaim transient
+   // resources early) and specifically for frames (not to queue too many), and
+   // await the availability of the current frame.
+-  CheckSubmissionFence(is_opening_frame ? closed_frame_submissions_[frame_current_ % kQueueFrames]
+-                                        : 0);
++  {
++    HitchScope hitch_fence(HitchPart::kFence);
++    CheckSubmissionFence(is_opening_frame ? closed_frame_submissions_[frame_current_ % kQueueFrames]
++                                          : 0);
++  }
+   // TODO(Triang3l): If failed to await (completed submission < awaited frame
+   // submission), do something like dropping the draw command that wanted to
+   // open the frame.
+@@ -3437,6 +3559,7 @@
+ }
+ 
+ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
++  HitchScope hitch_submit(HitchPart::kSubmission);
+   const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+ 
+   // Make sure there is a command allocator to write commands to.

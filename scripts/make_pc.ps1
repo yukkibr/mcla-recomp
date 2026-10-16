@@ -169,6 +169,11 @@ try {
         Patch "sdk-patch-scissor-audit" $sdk "$root\patches\rexglue-dx12-scissor-audit.patch"
         (Get-Item "$sdk\.mcla-patched" -Force).LastWriteTime = Get-Date
     }
+    # Frame hitch attribution without enabling the expensive ReXGlue CSV counters.
+    if (-not (Select-String -Quiet -SimpleMatch "d3d12_hitch_probe" "$sdk\src\graphics\d3d12\command_processor.cpp")) {
+        Patch "sdk-patch-hitch-probe" $sdk "$root\patches\rexglue-dx12-hitch-probe.patch"
+        (Get-Item "$sdk\.mcla-patched" -Force).LastWriteTime = Get-Date
+    }
     # Opt-in bounded D3D12 resource reuse pool, disabled by default.
     if (-not (Select-String -Quiet -SimpleMatch "resource_pool_limit_bytes_" "$sdk\include\rex\graphics\d3d12\texture_cache.h")) {
         Patch "sdk-patch-resource-pool" $sdk "$root\patches\rexglue-dx12-resource-pool.patch"
