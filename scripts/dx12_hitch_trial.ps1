@@ -11,7 +11,7 @@ if ($Mode -ne 'status' -and (Get-Process mcla -ErrorAction SilentlyContinue)) {
     throw 'Close MCLA before changing the DX12 diagnostic configuration.'
 }
 $raw = [IO.File]::ReadAllText($config)
-$keys = @('d3d12_hitch_probe', 'mcla_timing_trace')
+$keys = @('d3d12_hitch_probe', 'mcla_timing_trace', 'dx12_texture_stage_probe')
 if ($Mode -eq 'status') {
     foreach ($key in $keys) {
         $m = [regex]::Match($raw, '(?m)^[ \t]*' + $key + '[ \t]*=[ \t]*(true|false)')

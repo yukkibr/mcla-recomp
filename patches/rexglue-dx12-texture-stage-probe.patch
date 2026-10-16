@@ -1,0 +1,117 @@
+diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
+--- a/src/graphics/pipeline/texture/cache.cpp
++++ b/src/graphics/pipeline/texture/cache.cpp
+@@ -28,6 +28,12 @@
+ #include <rex/logging.h>
+ #include <rex/math.h>
+ #include <rex/perf/counter.h>
++
++// Supplemental to d3d12_hitch_probe: stages of CPU texture requests.
++// OFF by default; no new caches, uploads, texture state or GPU sync.
++REXCVAR_DEFINE_BOOL(dx12_texture_stage_probe, false, "GPU",
++                    "Measure texture binding/prep, guest residency and upload CPU costs")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
+ REXCVAR_DEFINE_INT32(texture_cache_memory_limit_render_to_texture, 24, "GPU",
+                      "Texture cache memory limit for render-to-texture (MB)")
+@@ -469,6 +475,9 @@
+ }
+ 
+ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
++  const bool stage_probe = REXCVAR_GET(dx12_texture_stage_probe);
++  using StageClock = std::chrono::steady_clock;
++  const auto stage_start = stage_probe ? StageClock::now() : StageClock::time_point{};
+   const auto& regs = register_file();
+ 
+   if (texture_became_outdated_.exchange(false, std::memory_order_acquire)) {
+@@ -585,6 +594,7 @@
+     PROFILE_TEXTURE_UPLOAD_REQUESTS(static_cast<int64_t>(pending_texture_loads.size()));
+   }
+ #endif
++  const auto stage_prepared = stage_probe ? StageClock::now() : StageClock::time_point{};
+   COUNT_profile_set("gpu/texture_cache/request_textures_pending_load_count",
+                     uint32_t(pending_texture_loads.size()));
+   COUNT_profile_set("gpu/texture_cache/request_textures_pending_range_count",
+@@ -613,6 +623,7 @@
+ #endif
+   }
+ 
++  const auto stage_resident = stage_probe ? StageClock::now() : StageClock::time_point{};
+   if (batched_shared_memory_request_succeeded) {
+     for (const PendingTextureLoad& pending_load : pending_texture_loads) {
+       CommitPreparedTextureLoad(pending_load);
+@@ -624,8 +635,74 @@
+       }
+     }
+   }
++  const auto stage_uploaded = stage_probe ? StageClock::now() : StageClock::time_point{};
+   if (bindings_changed) {
+     UpdateTextureBindingsImpl(bindings_changed);
++  }
++  if (stage_probe) {
++    const auto finished = StageClock::now();
++    const auto elapsed = [](StageClock::time_point a, StageClock::time_point b) {
++      return uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(b - a).count());
++    };
++    const uint64_t prep_us = elapsed(stage_start, stage_prepared);
++    const uint64_t resident_us = elapsed(stage_prepared, stage_resident);
++    const uint64_t upload_us = elapsed(stage_resident, stage_uploaded);
++    const uint64_t bindings_us = elapsed(stage_uploaded, finished);
++    const uint64_t total_us = elapsed(stage_start, finished);
++    struct StageStats {
++      StageClock::time_point started{};
++      uint64_t calls = 0;
++      uint64_t prep_us = 0;
++      uint64_t resident_us = 0;
++      uint64_t upload_us = 0;
++      uint64_t bindings_us = 0;
++      uint64_t pending_loads = 0;
++      uint64_t pending_ranges = 0;
++      uint64_t changed_bindings = 0;
++      uint64_t slow_calls = 0;
++      uint64_t peak_call_us = 0;
++      uint32_t events = 0;
++    };
++    static thread_local StageStats totals{};
++    if (totals.started == StageClock::time_point{}) {
++      totals.started = stage_start;
++    }
++    ++totals.calls;
++    totals.prep_us += prep_us;
++    totals.resident_us += resident_us;
++    totals.upload_us += upload_us;
++    totals.bindings_us += bindings_us;
++    totals.pending_loads += pending_texture_loads.size();
++    totals.pending_ranges += pending_shared_memory_ranges.size();
++    totals.changed_bindings += bindings_changed != 0;
++    totals.peak_call_us = std::max(totals.peak_call_us, total_us);
++    if (total_us >= 3000) {
++      ++totals.slow_calls;
++      if (totals.events < 4) {
++        REXLOG_INFO(
++            "Texture request stage spike: total {:.2f}ms, prep {:.2f}ms, "
++            "residency {:.2f}ms, upload {:.2f}ms, binding {:.2f}ms, "
++            "pending loads {}, ranges {}, changed bindings {}, residency success {}",
++            double(total_us) / 1000.0, double(prep_us) / 1000.0,
++            double(resident_us) / 1000.0, double(upload_us) / 1000.0,
++            double(bindings_us) / 1000.0, pending_texture_loads.size(),
++            pending_shared_memory_ranges.size(), bindings_changed != 0,
++            batched_shared_memory_request_succeeded);
++        ++totals.events;
++      }
++    }
++    if (finished - totals.started >= std::chrono::seconds(5)) {
++      REXLOG_INFO(
++          "Texture request stages: {} calls, prep {:.1f}ms, residency {:.1f}ms, "
++          "upload {:.1f}ms, binding {:.1f}ms, pending loads {}, ranges {}, "
++          "changed {}, calls over 3ms {}, peak {:.2f}ms (last 5s)",
++          totals.calls, double(totals.prep_us) / 1000.0,
++          double(totals.resident_us) / 1000.0, double(totals.upload_us) / 1000.0,
++          double(totals.bindings_us) / 1000.0, totals.pending_loads,
++          totals.pending_ranges, totals.changed_bindings, totals.slow_calls,
++          double(totals.peak_call_us) / 1000.0);
++      totals = {};
++    }
+   }
+ }
+ 

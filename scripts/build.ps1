@@ -23,8 +23,18 @@ try {
         (Select-String -Path $cache -SimpleMatch -Quiet $expectedFx) -and
         (Select-String -Path $cache -SimpleMatch -Quiet $expectedCounters)
     } else { $false }
-    if (-not (Test-Path "$root\out\build\$Preset\build.ninja") -or -not $current) {
-        cmake --preset $Preset "-DCMAKE_PREFIX_PATH=$env:REXSDK" "-DMCLA_ENABLE_FIDELITYFX_MENU=$fxMode" "-DMCLA_REX_PERF_COUNTERS=$counterMode" 2>&1 | ForEach-Object { "$_" } > "$root\out\configure.log"
+    # Upstream bef1563: avoid silently using an unrelated Clang on PATH.
+    $configured = Test-Path "$root\out\build\$Preset\build.ninja"
+    if ($configured -and $env:MCLA_CXX) {
+        $expectedCompiler = "set(CMAKE_CXX_COMPILER \`"$($env:MCLA_CXX.Replace('\', '/'))\`")"
+        $found = Get-ChildItem "$root\out\build\$Preset\CMakeFiles" -Recurse -Filter CMakeCXXCompiler.cmake -ErrorAction SilentlyContinue |
+            Select-String -Quiet -SimpleMatch $expectedCompiler
+        $configured = [bool]$found
+    }
+    if (-not $configured -or -not $current) {
+        $compilers = @()
+        if ($env:MCLA_CC) { $compilers = @("-DCMAKE_C_COMPILER=$env:MCLA_CC", "-DCMAKE_CXX_COMPILER=$env:MCLA_CXX") }
+        cmake --preset $Preset "-DCMAKE_PREFIX_PATH=$env:REXSDK" "-DMCLA_ENABLE_FIDELITYFX_MENU=$fxMode" "-DMCLA_REX_PERF_COUNTERS=$counterMode" @compilers 2>&1 | ForEach-Object { "$_" } > "$root\out\configure.log"
         if ($LASTEXITCODE -ne 0) { Get-Content "$root\out\configure.log" | Select-Object -Last 20; throw "configure failed" }
     }
     cmake --build --preset $Preset 2>&1 | ForEach-Object { "$_" } > "$root\out\build.log"

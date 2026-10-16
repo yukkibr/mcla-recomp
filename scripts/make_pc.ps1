@@ -85,7 +85,7 @@ try {
         $python = Get-Command python -ErrorAction SilentlyContinue
         if (-not $python -or $python.Source -like "*WindowsApps*") { $list += "Python" }
         if (-not (HasBuildTools)) { $list += "Visual Studio Build Tools" }
-        if (-not (Get-Command clang -ErrorAction SilentlyContinue)) { $list += "Clang" }
+        if (-not (Test-Path "$root\tools\$llvmName\bin\clang.exe")) { $list += "Clang" }
         $list
     }
     $missing = @(MissingTools)
@@ -121,7 +121,7 @@ try {
         $missing = @(MissingTools)
         if ($missing) { Fail "still missing after installing: $($missing -join ', '). A new PowerShell window may be needed; then run this again" }
     }
-    "clang: $((clang --version | Select-Object -First 1))"
+    "clang: $env:MCLA_CC ($((& $env:MCLA_CC --version | Select-Object -First 1)))"
 
     # -----------------------------------------------------------------------
     Step "2/6 ReXGlue SDK $sdkTag with this project's patches"
@@ -174,6 +174,11 @@ try {
         Patch "sdk-patch-hitch-probe" $sdk "$root\patches\rexglue-dx12-hitch-probe.patch"
         (Get-Item "$sdk\.mcla-patched" -Force).LastWriteTime = Get-Date
     }
+    # Detailed texture request stage attribution, OFF unless explicitly enabled.
+    if (-not (Select-String -Quiet -SimpleMatch "dx12_texture_stage_probe" "$sdk\src\graphics\pipeline\texture\cache.cpp")) {
+        Patch "sdk-patch-texture-stage" $sdk "$root\patches\rexglue-dx12-texture-stage-probe.patch"
+        (Get-Item "$sdk\.mcla-patched" -Force).LastWriteTime = Get-Date
+    }
     # Opt-in bounded D3D12 resource reuse pool, disabled by default.
     if (-not (Select-String -Quiet -SimpleMatch "resource_pool_limit_bytes_" "$sdk\include\rex\graphics\d3d12\texture_cache.h")) {
         Patch "sdk-patch-resource-pool" $sdk "$root\patches\rexglue-dx12-resource-pool.patch"
@@ -196,7 +201,7 @@ try {
         $installedFxMode -ne $fxMode -or $installedCounterMode -ne $counterMode) {
         Push-Location $sdk
         try {
-            Logged "sdk-configure" { cmake --preset win-amd64 -DREXGLUE_USE_VULKAN=ON -DREXGLUE_ENABLE_TRACY=OFF "-DREXGLUE_ENABLE_FIDELITYFX=$fxMode" "-DREXGLUE_ENABLE_PERF_COUNTERS=$counterMode" -DREXGLUE_FIDELITYFX_BACKEND=dx12 }
+            Logged "sdk-configure" { cmake --preset win-amd64 -DREXGLUE_USE_VULKAN=ON -DREXGLUE_ENABLE_TRACY=OFF "-DREXGLUE_ENABLE_FIDELITYFX=$fxMode" "-DREXGLUE_ENABLE_PERF_COUNTERS=$counterMode" -DREXGLUE_FIDELITYFX_BACKEND=dx12 "-DCMAKE_C_COMPILER=$env:MCLA_CC" "-DCMAKE_CXX_COMPILER=$env:MCLA_CXX" }
             if ($FidelityFX) {
                 # The pinned FidelityFX RC resource is UTF-16, which Clang 20 rejects.
                 Logged "sdk-prepare-fidelityfx" { python "$PSScriptRoot\prepare_fidelityfx.py" "$sdk\out\build\win-amd64" }
