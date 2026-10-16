@@ -164,6 +164,11 @@ try {
         Patch "sdk-patch-scissor-cache" $sdk "$root\patches\rexglue-dx12-scissor-cache.patch"
         (Get-Item "$sdk\.mcla-patched" -Force).LastWriteTime = Get-Date
     }
+    # Optional low-frequency scissor correctness audit, before any resource-pool patch.
+    if (-not (Select-String -Quiet -SimpleMatch "scissor_cache_audit_samples_" "$sdk\include\rex\graphics\d3d12\command_processor.h")) {
+        Patch "sdk-patch-scissor-audit" $sdk "$root\patches\rexglue-dx12-scissor-audit.patch"
+        (Get-Item "$sdk\.mcla-patched" -Force).LastWriteTime = Get-Date
+    }
     # Opt-in bounded D3D12 resource reuse pool, disabled by default.
     if (-not (Select-String -Quiet -SimpleMatch "resource_pool_limit_bytes_" "$sdk\include\rex\graphics\d3d12\texture_cache.h")) {
         Patch "sdk-patch-resource-pool" $sdk "$root\patches\rexglue-dx12-resource-pool.patch"
