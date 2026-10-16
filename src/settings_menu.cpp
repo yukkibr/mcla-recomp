@@ -467,7 +467,8 @@ struct ItemDef {
 // The console's display is 60 Hz.
 constexpr double kFpsTargets[] = {30.0, 60.0};
 #else
-constexpr double kFpsTargets[] = {30.0, 60.0, 120.0, 0.0};
+// 45 FPS is an optional diagnostic cap between the console's 30 and 60.
+constexpr double kFpsTargets[] = {30.0, 45.0, 60.0, 120.0, 0.0};
 #endif
 constexpr int kFpsTargetCount = int(sizeof(kFpsTargets) / sizeof(kFpsTargets[0]));
 #if !REX_PLATFORM_PS5

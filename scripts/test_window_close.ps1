@@ -1,5 +1,6 @@
 # Automated test for the normal window close lifecycle, no in-game inputs.
-param([int]$WarmupSeconds = 12, [int]$TimeoutSeconds = 25, [string[]]$ExtraArgs = @())
+param([int]$WarmupSeconds = 12, [int]$TimeoutSeconds = 25, [string[]]$ExtraArgs = @(),
+      [switch]$UseConfiguredFps)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 $build = Join-Path $root 'out\build\win-amd64-release'
@@ -15,9 +16,14 @@ public static class QuitQA {
 $argsList = @(
  "--game_data_root=$root\game", '--gpu_plugin=xenos',
  '--mcla_gpu_backend=d3d12', '--fullscreen=false',
- '--mcla_intro=fast', '--mcla_fps=30',
+ '--mcla_intro=fast',
  "--log_file=$log", '--log_level=info'
-) + $ExtraArgs
+)
+if (-not $UseConfiguredFps) {
+    # Preserve old 30 FPS behavior for previous Quit Game smoke tests.
+    $argsList += '--mcla_fps=30'
+}
+$argsList += $ExtraArgs
 $p = Start-Process -FilePath (Join-Path $build 'mcla.exe') -ArgumentList $argsList -WorkingDirectory $build -PassThru
 try {
  Start-Sleep -Seconds $WarmupSeconds

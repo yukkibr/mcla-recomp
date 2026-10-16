@@ -227,6 +227,12 @@ void MclaTickPerfOptions();
 void mcla_frame_delta(PPCRegister& r8) {
   MclaTickButtonPrompts();
   MclaTickPerfOptions();
+  // The early OnPostSetup log can precede the effective game-config value.
+  // Record the CVar once at the actual guest timer to verify A/B runs.
+  static std::atomic_flag reported_effective_cap = ATOMIC_FLAG_INIT;
+  if (!reported_effective_cap.test_and_set(std::memory_order_relaxed)) {
+    REXLOG_INFO("MCLA effective FPS target at guest timer: {}", REXCVAR_GET(mcla_fps));
+  }
   if (OriginalTiming()) {
     return;
   }
