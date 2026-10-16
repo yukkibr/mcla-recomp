@@ -1,0 +1,9 @@
+# Optional, read-only camera/target movement probe.
+# MCLA sub_8231CE30: 0x8231CEE0 is the first instruction after the optional
+# 0x8231B4E0/0x8231B740 camera-collision passes. r31 is the camera state.
+# The same point is documented and used for reverse engineering by LARecomp.
+# This does not change vehicle physics, camera matrices or guest time.
+[[midasm_hook]]
+name = "mcla_camera_motion_post"
+address = 0x8231CEE0
+registers = ["r31"]
