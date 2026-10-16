@@ -7,3 +7,11 @@
 name = "mcla_camera_motion_post"
 address = 0x8231CEE0
 registers = ["r31"]
+
+# sub_8220AA68 @0x8220AA88: r30 is the render-source matrix, immediately
+# after mr r30,r4 and before it is read and composed for camera effects.
+# Compare movement here to the earlier camera-state rig (read-only).
+[[midasm_hook]]
+name = "mcla_camera_motion_publish"
+address = 0x8220AA88
+registers = ["r30"]
