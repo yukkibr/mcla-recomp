@@ -54,6 +54,12 @@ REXCVAR_DEFINE_INT32(mcla_frame_stall_guard_ms, 125, "MCLA",
 // Off by default: skipping here also skips whatever puts the game logo on the
 // title screen (only "PRESS START" remains). Tested with and without the
 // render-pass mask change; the logo is missing either way.
+// Read-only, opt-in frame time diagnostics. Does not change frame pacing,
+// guest simulation deltas or the existing camera / vehicle smoothing hooks.
+REXCVAR_DEFINE_BOOL(mcla_timing_trace, false, "MCLA",
+                    "Log guest frame delta and camera FPS threshold transitions (5s summaries)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(mcla_skip_intro, false, "MCLA",
                     "Skip the intro movies. Side effect: the title screen loses its logo");
 
@@ -86,6 +92,78 @@ uint64_t NowMicros() {
   return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
                                    std::chrono::steady_clock::now().time_since_epoch())
                                    .count());
+}
+
+// Only read when diagnostics are explicitly enabled; no GPU or CSV counters.
+std::atomic<uint32_t> g_camera_fps_hundredths{0};
+std::atomic<uint64_t> g_camera_60fps_crossings{0};
+
+void TraceCameraRate(float fps) {
+  if (!REXCVAR_GET(mcla_timing_trace) || !std::isfinite(fps) || fps < 0.0f) {
+    return;
+  }
+  // The original chase camera changes its per-frame tune coefficient when
+  // round(1 / dt) crosses 60 FPS. Observe, do not override that decision.
+  static thread_local int previous_band = -1;
+  const int band = static_cast<int>(fps + 0.5f) >= 60 ? 1 : 0;
+  if (previous_band != -1 && previous_band != band) {
+    g_camera_60fps_crossings.fetch_add(1, std::memory_order_relaxed);
+  }
+  previous_band = band;
+  g_camera_fps_hundredths.store(
+      static_cast<uint32_t>(std::min(fps, 1000.0f) * 100.0f),
+      std::memory_order_relaxed);
+}
+
+void TraceGuestFrameDelta(uint64_t measured_ticks, uint64_t applied_ticks) {
+  if (!REXCVAR_GET(mcla_timing_trace)) {
+    return;
+  }
+  // MCLA can invoke its guest timer from more than one thread. Keep separate
+  // rolling summaries instead of introducing locks or thread contention.
+  struct Summary {
+    uint64_t window_start_us = 0;
+    uint64_t samples = 0;
+    double sum_ms = 0.0;
+    double peak_ms = 0.0;
+    uint64_t over_40ms = 0;
+    uint64_t over_67ms = 0;
+    uint64_t clamped = 0;
+    uint64_t previous_cam_crossings = 0;
+  };
+  static thread_local Summary summary{};
+  const uint64_t now_us = NowMicros();
+  if (!summary.window_start_us) {
+    summary.window_start_us = now_us;
+    summary.previous_cam_crossings =
+        g_camera_60fps_crossings.load(std::memory_order_relaxed);
+  }
+  const double clock_hz =
+      static_cast<double>(rex::chrono::Clock::guest_tick_frequency());
+  if (clock_hz <= 0.0) {
+    return;
+  }
+  const double ms = static_cast<double>(measured_ticks) * 1000.0 / clock_hz;
+  ++summary.samples;
+  summary.sum_ms += ms;
+  summary.peak_ms = std::max(summary.peak_ms, ms);
+  summary.over_40ms += ms > 40.0;
+  summary.over_67ms += ms > 67.0;
+  summary.clamped += measured_ticks > applied_ticks;
+  if (now_us - summary.window_start_us >= UINT64_C(5000000)) {
+    const uint64_t crossings =
+        g_camera_60fps_crossings.load(std::memory_order_relaxed);
+    REXLOG_INFO(
+        "MCLA timing trace: {} timer calls, raw dt mean {:.2f}ms peak {:.2f}ms, "
+        ">40ms {}, >67ms {}, guard clamps {}, camera {:.1f} FPS, "
+        "60-FPS crossings {} (last 5s)",
+        summary.samples, summary.sum_ms / static_cast<double>(summary.samples),
+        summary.peak_ms, summary.over_40ms, summary.over_67ms,
+        summary.clamped,
+        g_camera_fps_hundredths.load(std::memory_order_relaxed) / 100.0,
+        crossings - summary.previous_cam_crossings);
+    summary = {};
+  }
 }
 
 // Sleeps until the next frame deadline. The deadline advances by one period
@@ -158,9 +236,11 @@ void mcla_frame_delta(PPCRegister& r8) {
   // the next frame's measurement, so no time is lost, only shifted one frame.
   const uint64_t max_ticks = static_cast<uint64_t>(
       MaxGuestFrameSeconds() * static_cast<double>(rex::chrono::Clock::guest_tick_frequency()));
+  const uint64_t measured_ticks = r8.u64;
   if (r8.u64 > max_ticks) {
     r8.u64 = max_ticks;
   }
+  TraceGuestFrameDelta(measured_ticks, r8.u64);
 }
 
 bool mcla_use_real_delta() {
@@ -233,6 +313,7 @@ static void RescaleCameraFactor(PPCRegister& reg) {
   // below 60 (0x82320454..0x82320464), so the value arriving here is already
   // the 30 FPS factor in that case and the raw tune value otherwise.
   const float fps = ReadGuestFloat(kGuestFrameRate);
+  TraceCameraRate(fps);
   const bool already_halved = static_cast<int>(fps + 0.5f) < 60;
   reg.f64 = PerFrameToContinuous(already_halved ? raw : 0.5 * raw, dt);
 }
