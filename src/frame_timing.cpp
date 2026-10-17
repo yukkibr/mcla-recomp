@@ -264,7 +264,9 @@ void mcla_fixed_step_path(PPCRegister& r3, PPCRegister& f11) {
   // physics / camera simulation even when the earlier r8 hook was clamped.
   const double measured_delta = static_cast<double>(ReadGuestFloat(r3.u32 + 0x58));
   if (std::isfinite(measured_delta) && measured_delta >= 0.0) {
-    f11.f64 = std::min(measured_delta, MaxGuestFrameSeconds());
+    const double applied_delta = std::min(measured_delta, MaxGuestFrameSeconds());
+    f11.f64 = applied_delta;
+    MclaCorrelateFixedStep(measured_delta, applied_delta);
   }
 }
 

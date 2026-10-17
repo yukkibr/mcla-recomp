@@ -30,6 +30,12 @@ struct Stats {
   std::atomic<uint64_t> guest_over_40{0};
   std::atomic<uint64_t> guest_over_67{0};
   std::atomic<uint64_t> guest_clamps{0};
+  std::atomic<uint64_t> guest_clipped_us{0};
+  std::atomic<uint64_t> guest_peak_clipped_us{0};
+  std::atomic<uint64_t> fixed_calls{0};
+  std::atomic<uint64_t> fixed_clamps{0};
+  std::atomic<uint64_t> fixed_clipped_us{0};
+  std::atomic<uint64_t> fixed_peak_clipped_us{0};
   std::atomic<uint64_t> camera_updates{0};
   std::atomic<uint64_t> camera_long_gaps{0};
   std::atomic<uint64_t> camera_jumps{0};
@@ -81,6 +87,12 @@ void Report() {
   const uint64_t over40 = get(g_stats.guest_over_40);
   const uint64_t over67 = get(g_stats.guest_over_67);
   const uint64_t clamps = get(g_stats.guest_clamps);
+  const uint64_t timer_clipped_us = get(g_stats.guest_clipped_us);
+  const uint64_t timer_peak_us = get(g_stats.guest_peak_clipped_us);
+  const uint64_t fixed_calls = get(g_stats.fixed_calls);
+  const uint64_t fixed_clamps = get(g_stats.fixed_clamps);
+  const uint64_t fixed_clipped_us = get(g_stats.fixed_clipped_us);
+  const uint64_t fixed_peak_us = get(g_stats.fixed_peak_clipped_us);
   const uint64_t cam = get(g_stats.camera_updates);
   const uint64_t long_cam = get(g_stats.camera_long_gaps);
   const uint64_t cam_jump = get(g_stats.camera_jumps);
@@ -107,14 +119,19 @@ void Report() {
       "collision_shifts={} matrix_publishes={} publish_jumps={} "
       "rig_deviations={} publish_near_gap={} relative_samples={} "
       "relative_above_05m={} relative_above_15m={} relative_near_gap={} "
-      "relative_avg_mm={:.1f} relative_max_mm={}",
+      "relative_avg_mm={:.1f} relative_max_mm={} "
+      "timer_clipped_ms={:.2f} timer_max_clip_ms={:.2f} "
+      "fixed_calls={} fixed_clamps={} fixed_clipped_ms={:.2f} "
+      "fixed_max_clip_ms={:.2f}",
       presents, below45, gaps50, gaps100, double(max_gap) / 1000.0,
       timer, over40, over67, clamps, cam, long_cam, cam_jump,
       target_jump, cam_near, target_near, collisions, published,
       pub_jump, deviations, pub_near, offset_samples, offset05, offset15,
       offset_near,
       offset_samples ? double(offset_sum_mm) / double(offset_samples) : 0.0,
-      offset_max_mm);
+      offset_max_mm, double(timer_clipped_us) / 1000.0,
+      double(timer_peak_us) / 1000.0, fixed_calls, fixed_clamps,
+      double(fixed_clipped_us) / 1000.0, double(fixed_peak_us) / 1000.0);
 }
 }  // namespace
 
@@ -154,7 +171,31 @@ void MclaCorrelateGuestTimer(uint64_t measured_ticks, uint64_t applied_ticks) {
   Increment(g_stats.guest_timer_calls);
   Increment(g_stats.guest_over_40, ms > 40.0);
   Increment(g_stats.guest_over_67, ms > 67.0);
-  Increment(g_stats.guest_clamps, measured_ticks > applied_ticks);
+  const bool clipped = measured_ticks > applied_ticks;
+  Increment(g_stats.guest_clamps, clipped);
+  if (clipped) {
+    const auto us = static_cast<uint64_t>(
+        (double(measured_ticks - applied_ticks) / hz) * 1000000.0);
+    g_stats.guest_clipped_us.fetch_add(us, std::memory_order_relaxed);
+    UpdateMax(g_stats.guest_peak_clipped_us, us);
+  }
+}
+
+void MclaCorrelateFixedStep(double measured_s, double applied_s) {
+  if (!MclaHitchCorrelationEnabled()) return;
+  if (!(measured_s >= 0.0) || !(applied_s >= 0.0)) return;
+  Increment(g_stats.fixed_calls);
+  if (measured_s > applied_s) {
+    Increment(g_stats.fixed_clamps);
+    const double lost_s = measured_s - applied_s;
+    // Ignore corrupt/nonphysical time deltas. Very long loading intervals
+    // are reported separately from driving by the report's warmup filter.
+    if (lost_s < 3600.0) {
+      const auto us = static_cast<uint64_t>(lost_s * 1000000.0);
+      g_stats.fixed_clipped_us.fetch_add(us, std::memory_order_relaxed);
+      UpdateMax(g_stats.fixed_peak_clipped_us, us);
+    }
+  }
 }
 
 void MclaCorrelateCamera(uint64_t now_us, bool target_jump, bool camera_jump,

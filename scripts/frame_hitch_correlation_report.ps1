@@ -27,12 +27,26 @@ foreach ($file in $files) {
         $when = if ($line -match '^\[(?<date>[^\]]+)\]') { $Matches.date } else { '?' }
         $rows += [pscustomobject]@{ Time=$when; Data=$fields }
     }
+    $excluded = @($rows | Select-Object -First $SkipFirst)
+    if ($excluded.Count) {
+        Write-Output "Excluded warmup/transition windows in $($file.Name):"
+        $excluded | ForEach-Object {
+            $x = $_.Data
+            [pscustomobject]@{
+                At=$_.Time; Gap100=[long]$x.gap100; Clamps=[long]$x.clamps
+                Camera=[long]$x.camera_jumps; Relative15=[long]$x.relative_above_15m
+                MaxGapMs=[math]::Round($x.max_gap_ms,1)
+            }
+        } | Format-Table -AutoSize | Out-String -Width 155 | Write-Output
+    }
     $rows = @($rows | Select-Object -Skip $SkipFirst)
     if (!$rows.Count) { continue }
     $sum = @{}
     $max = 0.0
     $maxRelativeMm = 0.0
     $weightedRelativeMm = 0.0
+    $maxTimerClipMs = 0.0
+    $maxFixedClipMs = 0.0
     foreach ($row in $rows) {
         if ($row.Data.ContainsKey('relative_samples') -and $row.Data.ContainsKey('relative_avg_mm')) {
             $weightedRelativeMm += $row.Data.relative_samples * $row.Data.relative_avg_mm
@@ -41,7 +55,11 @@ foreach ($file in $files) {
             $maxRelativeMm = [math]::Max($maxRelativeMm, $row.Data.relative_max_mm)
         }
         foreach ($key in $row.Data.Keys) {
-            if ($key -eq 'max_gap_ms') {
+            if ($key -eq 'timer_max_clip_ms') {
+                $maxTimerClipMs = [math]::Max($maxTimerClipMs, $row.Data[$key])
+            } elseif ($key -eq 'fixed_max_clip_ms') {
+                $maxFixedClipMs = [math]::Max($maxFixedClipMs, $row.Data[$key])
+            } elseif ($key -eq 'max_gap_ms') {
                 $max = [math]::Max($max, $row.Data[$key])
             } else {
                 if (-not $sum.ContainsKey($key)) { $sum[$key] = 0.0 }
@@ -50,6 +68,13 @@ foreach ($file in $files) {
         }
     }
     $name = $file.Name
+    $hasStepTelemetry = $sum.ContainsKey('timer_clipped_ms') -and $sum.ContainsKey('fixed_clipped_ms')
+    $timerClip = if ($hasStepTelemetry) { [math]::Round($sum.timer_clipped_ms, 2) } else { '--' }
+    $fixedClip = if ($hasStepTelemetry) { [math]::Round($sum.fixed_clipped_ms, 2) } else { '--' }
+    $fixedCount = if ($hasStepTelemetry) { [long]$sum.fixed_calls } else { '--' }
+    $fixedClamps = if ($hasStepTelemetry) { [long]$sum.fixed_clamps } else { '--' }
+    $timerPeak = if ($hasStepTelemetry) { [math]::Round($maxTimerClipMs,2) } else { '--' }
+    $fixedPeak = if ($hasStepTelemetry) { [math]::Round($maxFixedClipMs,2) } else { '--' }
     $relativeMean = if ($sum.relative_samples) { [math]::Round($weightedRelativeMm / $sum.relative_samples,1) } else { 0 }
     $totals += [pscustomobject]@{
         Log=$name; Windows=$rows.Count; Presents=[long]$sum.present
@@ -69,17 +94,29 @@ foreach ($file in $files) {
         RelativeNear=[long]$sum.relative_near_gap
         RelativeMeanMm=$relativeMean
         RelativeMaxMm=[math]::Round($maxRelativeMm,0)
+        TimerClipMs=$timerClip; TimerMaxClipMs=$timerPeak
+        FixedCalls=$fixedCount; FixedClamps=$fixedClamps
+        FixedClipMs=$fixedClip; FixedMaxClipMs=$fixedPeak
     }
-    Write-Output "Per-window hitch timeline: $name (first $SkipFirst windows skipped)"
+    Write-Output "Per-window timing timeline: $name (first $SkipFirst windows skipped)"
+    $rows | ForEach-Object {
+        $x = $_.Data
+        $t = if ($x.ContainsKey('timer_clipped_ms')) { [math]::Round($x.timer_clipped_ms,1) } else { '--' }
+        $f = if ($x.ContainsKey('fixed_clipped_ms')) { [math]::Round($x.fixed_clipped_ms,1) } else { '--' }
+        [pscustomobject]@{
+            At=$_.Time; Gap50=[long]$x.gap50; Gap100=[long]$x.gap100
+            Clamps=[long]$x.clamps; TimerClipMs=$t; FixedClipMs=$f
+        }
+    } | Format-Table -AutoSize | Out-String -Width 130 | Write-Output
+    Write-Output "Per-window camera movement: $name"
     $rows | ForEach-Object {
         $x = $_.Data
         [pscustomobject]@{
-            At=$_.Time; Gap50=[long]$x.gap50; Gap100=[long]$x.gap100
-            Clamps=[long]$x.clamps; Camera=[long]$x.camera_jumps
+            At=$_.Time; Camera=[long]$x.camera_jumps
             Target=[long]$x.target_jumps; Publish=[long]$x.publish_jumps
             Offset05=[long]$x.relative_above_05m; Offset15=[long]$x.relative_above_15m
         }
-    } | Format-Table -AutoSize | Out-String -Width 160 | Write-Output
+    } | Format-Table -AutoSize | Out-String -Width 130 | Write-Output
 }
 if (!$totals.Count) {
     Write-Output 'No completed correlation windows. Enable the correlation trial and play for at least 20 seconds.'
@@ -100,3 +137,7 @@ $totals | Select-Object Log,CameraSamples,LongCameraGap,CameraJumps,TargetJumps,
 Write-Output 'Relative camera-to-render offset changes:'
 $totals | Select-Object Log,RelativeSamples,Relative05,Relative15,RelativeNear,RelativeMeanMm,RelativeMaxMm |
     Format-Table -AutoSize | Out-String -Width 160 | Write-Output
+Write-Output 'Measured duration withheld by each time-step guard (NOT additive across both hooks):'
+$totals | Select-Object Log,TimerClipMs,TimerMaxClipMs,FixedCalls,FixedClamps,FixedClipMs,FixedMaxClipMs |
+    Format-Table -AutoSize | Out-String -Width 170 | Write-Output
+Write-Output 'The r8 and f11 paths may describe overlapping time. Never add their clipping totals to claim total lost gameplay time.'
