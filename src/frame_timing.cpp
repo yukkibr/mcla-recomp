@@ -17,11 +17,13 @@
 #include "hitch_correlation.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <thread>
 
 #include <rex/chrono/clock.h>
@@ -47,6 +49,15 @@ REXCVAR_DEFINE_INT32(mcla_fps, 30, "MCLA",
 // produces a very late frame. This limits simulation jumps but cannot make
 // the host render faster; smaller caps may cause brief slow-motion instead.
 // 125 ms matches the previously shipped behavior (no change by default).
+// OFF preserves unrestricted FPS. ADAPTIVE targets the sustainable guest
+// timer rate (45-90 FPS), retaining slack and resetting on late frames.
+// STEADY45 is the prior reversible 45-FPS baseline, without changing mcla_fps.
+// Explicit mcla_fps targets always override these optional modes.
+REXCVAR_DEFINE_STRING(mcla_frame_pacing_mode, "off", "MCLA",
+                      "Guest timer frame pacing: off, adaptive, steady45")
+    .allowed({"off", "adaptive", "steady45"})
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_INT32(mcla_frame_stall_guard_ms, 125, "MCLA",
                      "Maximum real frame time advanced in one guest simulation "
                      "step after a hitch (50, 67, 125 ms)")
@@ -167,48 +178,156 @@ void TraceGuestFrameDelta(uint64_t measured_ticks, uint64_t applied_ticks) {
   }
 }
 
-// Sleeps until the next frame deadline. The deadline advances by one period
-// per frame; a frame that is already late resets it, so lateness is not
-// repaid by running the following frames faster.
+// A timer-hook pacer, not a GPU/Present fence. Neither adaptive pacing
+// nor a fixed cap can reduce a frame's real render/streaming cost.
+// The conservative adaptive ceiling is derived from the 75th percentile of
+// measured *non-waiting* guest-timer intervals every two seconds.
+// Crucially, a missed deadline never causes catch-up bursts.
 void WaitForFrameDeadline() {
-  static uint64_t next_us = 0;
-  // The timer function has callers on other threads; pace only the first one.
+  struct Pacer {
+    uint64_t next_us = 0;
+    uint64_t previous_entry_us = 0;
+    uint64_t previous_wait_us = 0;
+    uint64_t sample_start_us = 0;
+    uint64_t report_start_us = 0;
+    uint64_t reported_wait_us = 0;
+    uint64_t reported_late = 0;
+    uint32_t samples = 0;
+    uint32_t adaptive_fps = 45;
+    int32_t last_explicit_fps = -999;
+    std::string last_mode;
+    std::array<uint32_t, 96> work_buckets{};
+  };
+  // Guest timer can run on additional threads; retain the original
+  // single-owner rule so we never introduce competing sleepers.
   static const std::thread::id owner = std::this_thread::get_id();
   if (std::this_thread::get_id() != owner) {
     return;
   }
+  static Pacer pacer;
 
-  const int32_t fps = REXCVAR_GET(mcla_fps);
-  if (fps <= 0) {
-    next_us = 0;
-    return;
-  }
-  const uint64_t period_us = 1'000'000ull / static_cast<uint64_t>(fps);
-
-  uint64_t now = NowMicros();
-  if (next_us == 0) {
-    next_us = now + period_us;
-    return;
-  }
-  if (now < next_us) {
-    // Sleep most of the way, then spin the last stretch: sleeps overshoot by
-    // up to a millisecond or two, which is a large share of an 8.3 ms frame.
-    constexpr uint64_t kSpinMicros = 1500;
-    if (next_us - now > kSpinMicros + 500) {
-      std::this_thread::sleep_for(std::chrono::microseconds(next_us - now - kSpinMicros));
+  const int32_t explicit_fps = REXCVAR_GET(mcla_fps);
+  const auto mode = REXCVAR_GET(mcla_frame_pacing_mode);
+  const bool adaptive = explicit_fps == 0 && mode == "adaptive";
+  const bool steady = explicit_fps == 0 && mode == "steady45";
+  const bool changed = explicit_fps != pacer.last_explicit_fps ||
+                       mode != pacer.last_mode;
+  if (changed) {
+    pacer = {};
+    pacer.adaptive_fps = 45;
+    pacer.last_explicit_fps = explicit_fps;
+    pacer.last_mode = mode;
+    if (adaptive || steady) {
+      REXLOG_INFO("MCLA guest frame pacer: mode={} starting at 45 FPS "
+                  "(no catch-up, explicit FPS targets override)", mode);
     }
-    while (NowMicros() < next_us) {
+  }
+
+  if (explicit_fps <= 0 && !adaptive && !steady) {
+    // Preserve the original user's fully uncapped code path.
+    pacer.next_us = 0;
+    pacer.previous_entry_us = 0;
+    pacer.previous_wait_us = 0;
+    return;
+  }
+
+  const uint64_t entry_us = NowMicros();
+  if (adaptive) {
+    if (!pacer.sample_start_us) {
+      pacer.sample_start_us = entry_us;
+    }
+    if (pacer.previous_entry_us && entry_us > pacer.previous_entry_us) {
+      const uint64_t elapsed = entry_us - pacer.previous_entry_us;
+      const uint64_t busy_us = elapsed > pacer.previous_wait_us
+                                   ? elapsed - pacer.previous_wait_us
+                                   : elapsed;
+      // Exclude scene-loading stalls and abnormal thread pauses from the
+      // sustainable-rate estimate. Those still show up as long frames
+      // in the existing FPS benchmark and hitch correlator.
+      if (busy_us >= 1000 && busy_us <= 95000) {
+        const auto bin = static_cast<size_t>(
+            std::min<uint64_t>(95, (busy_us + 999) / 1000));
+        ++pacer.work_buckets[bin];
+        ++pacer.samples;
+      }
+    }
+    if (entry_us - pacer.sample_start_us >= UINT64_C(2000000)) {
+      if (pacer.samples >= 25) {
+        const uint32_t rank = (pacer.samples * 3 + 3) / 4;
+        uint32_t cumulative = 0;
+        size_t p75_ms = 95;
+        for (size_t i = 1; i < pacer.work_buckets.size(); ++i) {
+          cumulative += pacer.work_buckets[i];
+          if (cumulative >= rank) {
+            p75_ms = i;
+            break;
+          }
+        }
+        // At 20ms of work, choose ~46 FPS; at 25-30ms choose 45.
+        // Only gradually raise the cap when spare headroom persists.
+        const int desired = std::clamp(
+            static_cast<int>(1000.0 / (double(p75_ms) * 1.08)), 45, 90);
+        const int delta = std::clamp(
+            desired - static_cast<int>(pacer.adaptive_fps), -10, 6);
+        if (delta <= -2 || delta >= 2) {
+          pacer.adaptive_fps = static_cast<uint32_t>(
+              std::clamp(static_cast<int>(pacer.adaptive_fps) + delta, 45, 90));
+        }
+      }
+      pacer.work_buckets.fill(0);
+      pacer.samples = 0;
+      pacer.sample_start_us = entry_us;
+    }
+  }
+
+  const int32_t limit = explicit_fps > 0 ? explicit_fps :
+                        steady ? 45 : static_cast<int32_t>(pacer.adaptive_fps);
+  const uint64_t period_us = 1'000'000ull / static_cast<uint64_t>(limit);
+  if (!pacer.next_us) {
+    pacer.next_us = entry_us + period_us;
+    pacer.previous_entry_us = entry_us;
+    pacer.previous_wait_us = 0;
+    pacer.report_start_us = entry_us;
+    return;
+  }
+
+  if (entry_us < pacer.next_us) {
+    constexpr uint64_t kSpinMicros = 1500;
+    if (pacer.next_us - entry_us > kSpinMicros + 500) {
+      std::this_thread::sleep_for(
+          std::chrono::microseconds(pacer.next_us - entry_us - kSpinMicros));
+    }
+    while (NowMicros() < pacer.next_us) {
 #if defined(_WIN32)
       _mm_pause();
 #else
       std::this_thread::yield();
 #endif
     }
+  } else if (entry_us > pacer.next_us + 1000) {
+    ++pacer.reported_late;
   }
-  now = NowMicros();
-  next_us += period_us;
-  if (next_us < now) {
-    next_us = now + period_us;
+
+  const uint64_t after_us = NowMicros();
+  const uint64_t waited_us = after_us - entry_us;
+  pacer.previous_entry_us = entry_us;
+  pacer.previous_wait_us = waited_us;
+  pacer.reported_wait_us += waited_us;
+  // Never "catch up" by issuing an immediate burst of frames.
+  pacer.next_us += period_us;
+  if (pacer.next_us <= after_us) {
+    pacer.next_us = after_us + period_us;
+  }
+
+  if ((adaptive || steady) &&
+      after_us - pacer.report_start_us >= UINT64_C(10000000)) {
+    REXLOG_INFO("MCLA guest frame pacer: mode={} target={} fps "
+                "waited_ms={:.1f} late_calls={} over_10s",
+                mode, limit, double(pacer.reported_wait_us) / 1000.0,
+                pacer.reported_late);
+    pacer.report_start_us = after_us;
+    pacer.reported_wait_us = 0;
+    pacer.reported_late = 0;
   }
 }
 

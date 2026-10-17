@@ -476,6 +476,9 @@ constexpr int kFpsTargetCount = int(sizeof(kFpsTargets) / sizeof(kFpsTargets[0])
 // exchange post-hitch camera/vehicle jumps for a brief loss of game time.
 constexpr const char* kStallGuardValues[] = {"125", "67", "50"};
 constexpr const char* kStallGuardLabels[] = {"ORIGINAL", "GENTLE", "STRONG"};
+// Optional guest-timer pacing without changing the player's FPS TARGET.
+constexpr const char* kPacingModes[] = {"off", "adaptive", "steady45"};
+constexpr const char* kPacingLabels[] = {"OFF (UNCAPPED)", "ADAPTIVE", "STEADY 45"};
 #endif
 constexpr const char* kPromptValues[] = {"auto", "xbox", "playstation"};
 constexpr const char* kPromptLabels[] = {"AUTO", "XBOX", "PLAYSTATION"};
@@ -522,6 +525,7 @@ const ItemDef kDisplayItems[] = {
      "FSR SOFTENING (NEXT START)", nullptr, nullptr, kFsrSharpnessReduction, 5, "%.1f"},
 #endif  // MCLA_FIDELITYFX_MENU
 #endif  // !REX_PLATFORM_PS5
+    {"PM_MxShadows", ItemKind::kToggle, "mcla_shadows", "SHADOWS"},
     {"PM_MxMotionBlur", ItemKind::kToggle, "mcla_motion_blur", "MOTION BLUR"},
     {"PM_MxDof", ItemKind::kToggle, "mcla_depth_of_field", "DEPTH OF FIELD"},
 };
@@ -549,10 +553,11 @@ const ItemDef kPerformanceItems[] = {
     {"PM_MxPipelineWorkers", ItemKind::kStringChoice, "d3d12_pipeline_creation_threads",
      "DX12 PIPELINE WORKERS (NEXT START)", kPipelineWorkerValues,
      kPipelineWorkerLabels, nullptr, 4},
+    {"PM_MxFramePacing", ItemKind::kStringChoice, "mcla_frame_pacing_mode",
+     "FRAME PACING", kPacingModes, kPacingLabels, nullptr, 3},
 #endif
     {"PM_MxSingleTile", ItemKind::kToggle, "mcla_single_tile", "SINGLE TILE RENDERING"},
     {"PM_MxFenceYield", ItemKind::kToggle, "mcla_fence_yield", "GPU WAIT YIELD"},
-    {"PM_MxShadows", ItemKind::kToggle, "mcla_shadows", "SHADOWS"},
     {"PM_MxFoliageShadows", ItemKind::kToggle, "mcla_foliage_shadows", "FOLIAGE SHADOWS"},
     {"PM_MxCityLod", ItemKind::kNumberChoice, "mcla_city_lod", "CITY DETAIL DISTANCE", nullptr,
      nullptr, kDetailScales, 3, "%.2f"},
