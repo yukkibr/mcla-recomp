@@ -2,6 +2,7 @@
 // Uses the existing ReXGlue ImGui presenter (no external window or DX12 hooks).
 #include "fps_overlay.h"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -16,6 +17,11 @@
 REXCVAR_DEFINE_BOOL(mcla_show_fps, false, "MCLA",
                     "Display guest present FPS, average frametime and peak frametime");
 
+// Opt-in 10-second samples for real A/B tests. Does not touch GPU timing,
+// resource uploads or the existing FPS overlay.
+REXCVAR_DEFINE_BOOL(mcla_fps_benchmark, false, "MCLA",
+                    "Log 10-second guest present FPS, p99 frametime and stalls");
+
 namespace {
 std::atomic<uint32_t> g_fps_hundredths{0};
 std::atomic<uint32_t> g_frame_ms_hundredths{0};
@@ -26,6 +32,90 @@ uint64_t NowMicros() {
   return uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
                       std::chrono::steady_clock::now().time_since_epoch())
                       .count());
+}
+
+// One fixed-size histogram per presenting thread; no per-frame allocations,
+// sorting or GPU queries. Bucket 256 means 256 ms or more.
+struct BenchmarkWindow {
+  uint64_t start_us = 0;
+  uint64_t previous_us = 0;
+  uint64_t accumulated_us = 0;
+  uint64_t maximum_us = 0;
+  uint32_t frames = 0;
+  uint32_t stalls_50 = 0;
+  uint32_t stalls_100 = 0;
+  std::array<uint32_t, 257> histogram{};
+
+  void Reset(uint64_t now_us) {
+    start_us = now_us;
+    previous_us = now_us;
+    accumulated_us = 0;
+    maximum_us = 0;
+    frames = 0;
+    stalls_50 = 0;
+    stalls_100 = 0;
+    histogram.fill(0);
+  }
+};
+
+void RecordBenchmarkGuestPresent(uint64_t now_us) {
+  thread_local BenchmarkWindow window;
+  thread_local bool active = false;
+  if (!REXCVAR_GET(mcla_fps_benchmark)) {
+    active = false;
+    return;
+  }
+  if (!active) {
+    active = true;
+    window.Reset(now_us);
+    REXLOG_INFO("MCLA FPS benchmark: 10-second guest-present sampling enabled");
+    return;
+  }
+  if (now_us <= window.previous_us) {
+    window.Reset(now_us);
+    return;
+  }
+
+  const uint64_t interval_us = now_us - window.previous_us;
+  window.previous_us = now_us;
+  window.accumulated_us += interval_us;
+  if (interval_us > window.maximum_us) {
+    window.maximum_us = interval_us;
+  }
+  ++window.frames;
+  if (interval_us >= 50000) ++window.stalls_50;
+  if (interval_us >= 100000) ++window.stalls_100;
+  const auto bucket = static_cast<size_t>(
+      interval_us >= 256000 ? 256 : interval_us / 1000);
+  ++window.histogram[bucket];
+
+  const uint64_t elapsed_us = now_us - window.start_us;
+  if (elapsed_us < 10000000) {
+    return;
+  }
+
+  // 99th percentile of inter-present interval, quantized to 1 ms. A bucket
+  // of 256 represents >=256 ms; use maximum_us for exact longest stall.
+  const uint32_t rank =
+      static_cast<uint32_t>((uint64_t(window.frames) * 99 + 99) / 100);
+  uint32_t cumulative = 0;
+  size_t p99_bucket = 256;
+  for (size_t i = 0; i < window.histogram.size(); ++i) {
+    cumulative += window.histogram[i];
+    if (cumulative >= rank) {
+      p99_bucket = i;
+      break;
+    }
+  }
+
+  REXLOG_INFO(
+      "MCLA FPS benchmark: fps={:.2f} avg_ms={:.2f} p99_bucket_ms={} "
+      "max_ms={:.2f} stalls50={} stalls100={} frames={} seconds={:.2f}",
+      double(window.frames) * 1000000.0 / double(window.accumulated_us),
+      double(window.accumulated_us) / (1000.0 * double(window.frames)),
+      p99_bucket, double(window.maximum_us) / 1000.0, window.stalls_50,
+      window.stalls_100, window.frames, double(elapsed_us) / 1000000.0);
+  window.Reset(now_us);
 }
 
 class MclaFpsHud final : public rex::ui::ImGuiDialog {
@@ -84,6 +174,7 @@ void MclaRecordGuestPresent() {
   thread_local uint32_t count = 0;
 
   const uint64_t now = NowMicros();
+  RecordBenchmarkGuestPresent(now);
   if (last_us && now > last_us) {
     const uint64_t delta = now - last_us;
     if (delta > peak_delta_us) {
