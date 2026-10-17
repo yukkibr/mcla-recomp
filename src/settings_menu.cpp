@@ -526,6 +526,7 @@ const ItemDef kDisplayItems[] = {
 #endif  // MCLA_FIDELITYFX_MENU
 #endif  // !REX_PLATFORM_PS5
     {"PM_MxShadows", ItemKind::kToggle, "mcla_shadows", "SHADOWS"},
+    {"PM_MxRaceShadows", ItemKind::kToggle, "mcla_race_shadows", "RACE SHADOWS (NEXT START)"},
     {"PM_MxMotionBlur", ItemKind::kToggle, "mcla_motion_blur", "MOTION BLUR"},
     {"PM_MxDof", ItemKind::kToggle, "mcla_depth_of_field", "DEPTH OF FIELD"},
 };
@@ -544,6 +545,10 @@ constexpr const char* kCityProfileLabels[] = {"CUSTOM", "STANDARD", "BALANCED", 
 // compilation speed for less CPU contention with GPU command translation.
 constexpr const char* kPipelineWorkerValues[] = {"-1", "2", "4", "8"};
 constexpr const char* kPipelineWorkerLabels[] = {"AUTO", "2 THREADS", "4 THREADS", "8 THREADS"};
+// Opt-in bounded DX12 resource recycling. Requires a full restart because
+// the resource pool is initialized when the D3D12 texture cache is created.
+constexpr const char* kResourcePoolValues[] = {"0", "64", "128"};
+constexpr const char* kResourcePoolLabels[] = {"OFF", "64 MB", "128 MB"};
 #endif
 
 const ItemDef kPerformanceItems[] = {
@@ -555,6 +560,8 @@ const ItemDef kPerformanceItems[] = {
      kPipelineWorkerLabels, nullptr, 4},
     {"PM_MxFramePacing", ItemKind::kStringChoice, "mcla_frame_pacing_mode",
      "FRAME PACING", kPacingModes, kPacingLabels, nullptr, 3},
+    {"PM_MxResourcePool", ItemKind::kStringChoice, "d3d12_texture_resource_pool_mb",
+     "DX12 TEXTURE REUSE (NEXT START)", kResourcePoolValues, kResourcePoolLabels, nullptr, 3},
 #endif
     {"PM_MxSingleTile", ItemKind::kToggle, "mcla_single_tile", "SINGLE TILE RENDERING"},
     {"PM_MxFenceYield", ItemKind::kToggle, "mcla_fence_yield", "GPU WAIT YIELD"},
@@ -569,7 +576,6 @@ const ItemDef kPerformanceItems[] = {
      kDensityScales, 3, "%.1f", "NONE"},
     {"PM_MxParked", ItemKind::kNumberChoice, "mcla_parked_cars", "PARKED CARS", nullptr, nullptr,
      kDensityScales, 3, "%.1f", "NONE"},
-    {"PM_MxRaceShadows", ItemKind::kToggle, "mcla_race_shadows", "RACE SHADOWS (NEXT START)"},
     {"PM_MxFastCarShadows", ItemKind::kToggle, "mcla_fast_car_shadows",
      "SIMPLE CAR SHADOWS (NEXT START)"},
     {"PM_MxImpostors", ItemKind::kToggle, "mcla_foliage_impostors", "DISTANT TREES (NEXT LOAD)"},
