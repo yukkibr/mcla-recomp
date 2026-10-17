@@ -1,0 +1,180 @@
+diff --git a/include/rex/graphics/d3d12/texture_cache.h b/include/rex/graphics/d3d12/texture_cache.h
+index ecf431d..9615f19 100644
+--- a/include/rex/graphics/d3d12/texture_cache.h
++++ b/include/rex/graphics/d3d12/texture_cache.h
+@@ -233,11 +233,29 @@ class D3D12TextureCache final : public TextureCache {
+   };
+   void RecycleTextureResource(ID3D12Resource* resource, D3D12_RESOURCE_STATES state,
+                               uint64_t last_submission, uint64_t bytes);
++  void ReportTexturePoolProbe();
+   std::vector<PooledResource> resource_pool_;
+   uint64_t resource_pool_bytes_ = 0;
+   uint64_t resource_pool_limit_bytes_ = 0;
+   uint64_t resource_pool_hits_ = 0;
+   uint64_t resource_pool_misses_ = 0;
++  // Optional read-only GPU Commands CPU telemetry. All these counters are
++  // accessed only by the existing texture cache owner thread.
++  uint64_t resource_pool_probe_last_us_ = 0;
++  uint64_t resource_pool_recycle_attempts_ = 0;
++  uint64_t resource_pool_recycle_stored_ = 0;
++  uint64_t resource_pool_reject_untracked_ = 0;
++  uint64_t resource_pool_reject_gpu_busy_ = 0;
++  uint64_t resource_pool_reject_oversized_ = 0;
++  uint64_t resource_pool_reject_other_ = 0;
++  uint64_t resource_pool_evictions_ = 0;
++  uint64_t resource_pool_peak_bytes_ = 0;
++  uint64_t resource_pool_description_misses_ = 0;
++  uint64_t resource_pool_committed_creates_ = 0;
++  uint64_t resource_pool_committed_failures_ = 0;
++  uint64_t resource_pool_committed_us_ = 0;
++  uint64_t resource_pool_committed_peak_us_ = 0;
++  uint32_t resource_pool_slow_reports_ = 0;
+ 
+   class D3D12Texture final : public Texture {
+    public:
+diff --git a/src/graphics/d3d12/texture_cache.cpp b/src/graphics/d3d12/texture_cache.cpp
+index c896e1d..6f07a0e 100644
+--- a/src/graphics/d3d12/texture_cache.cpp
++++ b/src/graphics/d3d12/texture_cache.cpp
+@@ -40,6 +40,10 @@ REXCVAR_DEFINE_INT32(d3d12_texture_resource_pool_mb, 0, "GPU",
+     .range(0, 256)
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
++REXCVAR_DEFINE_BOOL(d3d12_texture_resource_pool_probe, false, "GPU",
++                    "Measure completed texture reuse, rejection reasons, and CPU resource creation time")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++
+ namespace rex::graphics::d3d12 {
+ 
+ // Generated with `xb buildshaders`.
+@@ -1545,17 +1549,31 @@ uint32_t D3D12TextureCache::GetMaxHostTextureDepthOrArraySize(
+ void D3D12TextureCache::RecycleTextureResource(
+     ID3D12Resource* resource, D3D12_RESOURCE_STATES state, uint64_t last_submission,
+     uint64_t bytes) {
+-  // A cached resource may be reclaimed only when no queued GPU command
+-  // references it. Never recycle untracked textures (submission 0).
+-  if (!resource_pool_limit_bytes_ || !resource || !bytes ||
+-      bytes > resource_pool_limit_bytes_ || !last_submission ||
+-      last_submission > command_processor_.GetCompletedSubmission()) {
++  // The probe must not change GPU ownership or texture lifetime. Never hold
++  // incomplete submissions in the reusable pool, even when diagnostics are on.
++  const bool probe = REXCVAR_GET(d3d12_texture_resource_pool_probe);
++  if (probe) ++resource_pool_recycle_attempts_;
++  if (!resource_pool_limit_bytes_ || !resource || !bytes) {
++    if (probe) ++resource_pool_reject_other_;
++    return;
++  }
++  if (bytes > resource_pool_limit_bytes_) {
++    if (probe) ++resource_pool_reject_oversized_;
++    return;
++  }
++  if (!last_submission) {
++    if (probe) ++resource_pool_reject_untracked_;
++    return;
++  }
++  if (last_submission > command_processor_.GetCompletedSubmission()) {
++    if (probe) ++resource_pool_reject_gpu_busy_;
+     return;
+   }
+   while (!resource_pool_.empty() &&
+          resource_pool_bytes_ + bytes > resource_pool_limit_bytes_) {
+     resource_pool_bytes_ -= resource_pool_.front().bytes;
+     resource_pool_.erase(resource_pool_.begin());
++    if (probe) ++resource_pool_evictions_;
+   }
+   PooledResource entry{};
+   entry.desc = resource->GetDesc();
+@@ -1564,9 +1582,48 @@ void D3D12TextureCache::RecycleTextureResource(
+   entry.bytes = bytes;
+   resource_pool_.push_back(std::move(entry));
+   resource_pool_bytes_ += bytes;
++  if (probe) {
++    ++resource_pool_recycle_stored_;
++    resource_pool_peak_bytes_ = std::max(resource_pool_peak_bytes_, resource_pool_bytes_);
++  }
++}
++
++void D3D12TextureCache::ReportTexturePoolProbe() {
++  if (!REXCVAR_GET(d3d12_texture_resource_pool_probe)) return;
++  using ProbeClock = std::chrono::steady_clock;
++  const auto now_us = static_cast<uint64_t>(
++      std::chrono::duration_cast<std::chrono::microseconds>(
++          ProbeClock::now().time_since_epoch()).count());
++  if (!resource_pool_probe_last_us_) {
++    resource_pool_probe_last_us_ = now_us;
++    REXGPU_INFO("DX12 texture pool probe active: pool_limit_mb={} (cumulative counters)",
++                resource_pool_limit_bytes_ >> 20);
++    return;
++  }
++  if (now_us - resource_pool_probe_last_us_ < UINT64_C(10000000)) return;
++  resource_pool_probe_last_us_ = now_us;
++  REXGPU_INFO(
++      "DX12 texture pool probe: creations={} create_failures={} "
++      "create_total_ms={:.2f} create_peak_ms={:.2f} "
++      "recycle_attempts={} recycled={} reject_untracked={} "
++      "reject_busy={} reject_oversized={} reject_other={} "
++      "reuses={} misses={} desc_misses={} evictions={} "
++      "pool_entries={} pool_mb={:.2f} pool_peak_mb={:.2f}",
++      resource_pool_committed_creates_, resource_pool_committed_failures_,
++      double(resource_pool_committed_us_) / 1000.0,
++      double(resource_pool_committed_peak_us_) / 1000.0,
++      resource_pool_recycle_attempts_, resource_pool_recycle_stored_,
++      resource_pool_reject_untracked_, resource_pool_reject_gpu_busy_,
++      resource_pool_reject_oversized_, resource_pool_reject_other_,
++      resource_pool_hits_, resource_pool_misses_,
++      resource_pool_description_misses_, resource_pool_evictions_,
++      resource_pool_.size(), double(resource_pool_bytes_) / (1024.0 * 1024.0),
++      double(resource_pool_peak_bytes_) / (1024.0 * 1024.0));
+ }
+ 
+ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(TextureKey key) {
++  const bool pool_probe = REXCVAR_GET(d3d12_texture_resource_pool_probe);
++  if (pool_probe) ReportTexturePoolProbe();
+   D3D12_RESOURCE_DESC desc;
+   desc.Format = GetDXGIResourceFormat(key);
+   if (desc.Format == DXGI_FORMAT_UNKNOWN) {
+@@ -1631,6 +1688,9 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(TextureK
+           new D3D12Texture(*this, key, resource.Get(), resource_state));
+     }
+     ++resource_pool_misses_;
++    if (pool_probe && !resource_pool_.empty()) {
++      ++resource_pool_description_misses_;
++    }
+     if (resource_pool_misses_ == 1024) {
+       REXGPU_INFO("DX12 texture resource pool: 1024 misses, {} reuses",
+                   resource_pool_hits_);
+@@ -1642,9 +1702,31 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(TextureK
+       profile_allocations ? std::chrono::steady_clock::now()
+                           : std::chrono::steady_clock::time_point{};
+ #endif
+-  if (FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesDefault,
+-                                             provider.GetHeapFlagCreateNotZeroed(), &desc,
+-                                             resource_state, nullptr, IID_PPV_ARGS(&resource)))) {
++  const auto pool_creation_start =
++      pool_probe ? std::chrono::steady_clock::now()
++                 : std::chrono::steady_clock::time_point{};
++  const HRESULT create_result = device->CreateCommittedResource(
++      &ui::d3d12::util::kHeapPropertiesDefault,
++      provider.GetHeapFlagCreateNotZeroed(), &desc,
++      resource_state, nullptr, IID_PPV_ARGS(&resource));
++  if (pool_probe) {
++    const auto elapsed_us = static_cast<uint64_t>(
++        std::chrono::duration_cast<std::chrono::microseconds>(
++            std::chrono::steady_clock::now() - pool_creation_start).count());
++    ++resource_pool_committed_creates_;
++    resource_pool_committed_us_ += elapsed_us;
++    resource_pool_committed_peak_us_ =
++        std::max(resource_pool_committed_peak_us_, elapsed_us);
++    if (FAILED(create_result)) ++resource_pool_committed_failures_;
++    if (elapsed_us >= UINT64_C(5000) && resource_pool_slow_reports_ < 8) {
++      ++resource_pool_slow_reports_;
++      REXGPU_INFO("DX12 texture resource create slow: {:.2f}ms format={} "
++                  "width={} height={} mips={}",
++                  double(elapsed_us) / 1000.0, uint32_t(desc.Format),
++                  desc.Width, desc.Height, desc.MipLevels);
++    }
++  }
++  if (FAILED(create_result)) {
+     return nullptr;
+   }
+ #ifdef REXGLUE_ENABLE_PERF_COUNTERS

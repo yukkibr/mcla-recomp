@@ -56,6 +56,16 @@ function Patch([string]$name, [string]$repo, [string]$patch) {
     Logged $name { git -C $repo apply $patch }
 }
 
+# A later patch layered on top of the local SDK resource-pool patch may
+# encounter harmless whitespace drift from Windows Git settings. Use relaxed
+# matching *only* for this one versioned incremental telemetry patch.
+function PatchTexturePoolProbe([string]$repo, [string]$patch) {
+    $ErrorActionPreference = "Continue"
+    git -C $repo apply --reverse --check --ignore-whitespace $patch 2>&1 | Out-Null
+    if ($LASTEXITCODE -eq 0) { "already applied: $(Split-Path $patch -Leaf)"; return }
+    Logged "sdk-patch-resource-pool-probe" { git -C $repo apply --ignore-whitespace $patch }
+}
+
 Push-Location $root
 try {
     # -----------------------------------------------------------------------
@@ -194,6 +204,12 @@ try {
     # Opt-in bounded D3D12 resource reuse pool, disabled by default.
     if (-not (Select-String -Quiet -SimpleMatch "resource_pool_limit_bytes_" "$sdk\include\rex\graphics\d3d12\texture_cache.h")) {
         Patch "sdk-patch-resource-pool" $sdk "$root\patches\rexglue-dx12-resource-pool.patch"
+        (Get-Item "$sdk\.mcla-patched" -Force).LastWriteTime = Get-Date
+    }
+    # Read-only, opt-in DX12 texture pool failure reasons and resource-creation
+    # timings. The runtime path is unchanged when its CVar is disabled.
+    if (-not (Select-String -Quiet -SimpleMatch "d3d12_texture_resource_pool_probe" "$sdk\src\graphics\d3d12\texture_cache.cpp")) {
+        PatchTexturePoolProbe $sdk "$root\patches\rexglue-dx12-texture-pool-telemetry.patch"
         (Get-Item "$sdk\.mcla-patched" -Force).LastWriteTime = Get-Date
     }
 
