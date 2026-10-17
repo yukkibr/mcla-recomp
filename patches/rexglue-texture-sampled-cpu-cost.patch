@@ -1,0 +1,179 @@
+diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
+--- a/src/graphics/pipeline/texture/cache.cpp
++++ b/src/graphics/pipeline/texture/cache.cpp
+@@ -35,6 +35,12 @@
+ // already synchronized and no texture-memory watch has invalidated them.
+ REXCVAR_DEFINE_BOOL(texture_request_fast_path, false, "GPU",
+                     "Avoid redundant texture request setup and reuse temporary load vectors")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++// Opt-in sparse CPU instrumentation: one in 257 calls is timed, and all
++// counters are thread-local. No texture, GPU, binding, or cache changes.
++REXCVAR_DEFINE_BOOL(texture_request_sample_probe, false, "GPU",
++                    "Sample CPU cost of bypassed, redundant and active texture requests")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
+ REXCVAR_DEFINE_BOOL(dx12_texture_stage_probe, false, "GPU",
+@@ -492,6 +498,112 @@
+   const bool stage_probe = REXCVAR_GET(dx12_texture_stage_probe);
+   using StageClock = std::chrono::steady_clock;
+   const auto stage_start = stage_probe ? StageClock::now() : StageClock::time_point{};
++  // Independent of the more expensive per-request stage probe. Only time
++  // 1 in 257 calls; count every request and report once per ~10 seconds.
++  // Comparing ON vs OFF exposes how much time a synchronized original no-op
++  // request takes versus a bypass, without changing cache semantics.
++  using SampleClock = std::chrono::steady_clock;
++  struct TextureRequestSample {
++    SampleClock::time_point started{};
++    uint64_t calls = 0;
++    uint64_t bypassed = 0;
++    uint64_t original_noop = 0;
++    uint64_t active = 0;
++    uint64_t bypass_samples = 0;
++    uint64_t noop_samples = 0;
++    uint64_t active_samples = 0;
++    uint64_t bypass_ns = 0;
++    uint64_t noop_ns = 0;
++    uint64_t active_prep_ns = 0;
++    uint64_t active_resident_ns = 0;
++    uint64_t active_upload_ns = 0;
++    uint64_t active_binding_ns = 0;
++    uint64_t slow_active_samples = 0;
++    uint64_t max_active_ns = 0;
++  };
++  static thread_local TextureRequestSample request_sample{};
++  const bool sample_probe =
++      REXCVAR_GET(texture_request_sample_probe) && !stage_probe;
++  bool sample_this = false;
++  SampleClock::time_point sample_start{};
++  if (sample_probe) {
++    if (request_sample.started == SampleClock::time_point{}) {
++      request_sample.started = SampleClock::now();
++    }
++    sample_this = (++request_sample.calls % 257) == 0;
++    if (sample_this) {
++      sample_start = SampleClock::now();
++    }
++  }
++
++  auto finish_sample = [&](bool bypass, bool no_op,
++                           SampleClock::time_point prepared,
++                           SampleClock::time_point resident,
++                           SampleClock::time_point uploaded) {
++    if (!sample_probe) {
++      return;
++    }
++    if (bypass) {
++      ++request_sample.bypassed;
++    } else if (no_op) {
++      ++request_sample.original_noop;
++    } else {
++      ++request_sample.active;
++    }
++    if (!sample_this) {
++      return;
++    }
++    const auto now = SampleClock::now();
++    const auto ns = [](SampleClock::time_point a, SampleClock::time_point b) {
++      return uint64_t(
++          std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
++    };
++    const uint64_t total_ns = ns(sample_start, now);
++    if (bypass) {
++      ++request_sample.bypass_samples;
++      request_sample.bypass_ns += total_ns;
++    } else if (no_op) {
++      ++request_sample.noop_samples;
++      request_sample.noop_ns += total_ns;
++    } else {
++      ++request_sample.active_samples;
++      request_sample.active_prep_ns += ns(sample_start, prepared);
++      request_sample.active_resident_ns += ns(prepared, resident);
++      request_sample.active_upload_ns += ns(resident, uploaded);
++      request_sample.active_binding_ns += ns(uploaded, now);
++      if (total_ns >= UINT64_C(3000000)) {
++        ++request_sample.slow_active_samples;
++      }
++      request_sample.max_active_ns =
++          std::max(request_sample.max_active_ns, total_ns);
++    }
++    if (now - request_sample.started >= std::chrono::seconds(10)) {
++      const auto average_us = [](uint64_t elapsed_ns, uint64_t count) {
++        return count ? double(elapsed_ns) / (1000.0 * double(count)) : 0.0;
++      };
++      REXGPU_INFO(
++          "Texture request sample: total={} skipped={} original_noop={} "
++          "active={} sampled_skip={} sampled_noop={} sampled_active={} "
++          "avg_skip_us={:.2f} avg_noop_us={:.2f} avg_active_prep_us={:.2f} "
++          "avg_active_resident_us={:.2f} avg_active_upload_us={:.2f} "
++          "avg_active_binding_us={:.2f} slow_active_samples={} "
++          "max_sampled_active_ms={:.2f}",
++          request_sample.calls, request_sample.bypassed,
++          request_sample.original_noop, request_sample.active,
++          request_sample.bypass_samples, request_sample.noop_samples,
++          request_sample.active_samples,
++          average_us(request_sample.bypass_ns, request_sample.bypass_samples),
++          average_us(request_sample.noop_ns, request_sample.noop_samples),
++          average_us(request_sample.active_prep_ns, request_sample.active_samples),
++          average_us(request_sample.active_resident_ns, request_sample.active_samples),
++          average_us(request_sample.active_upload_ns, request_sample.active_samples),
++          average_us(request_sample.active_binding_ns, request_sample.active_samples),
++          request_sample.slow_active_samples,
++          double(request_sample.max_active_ns) / 1000000.0);
++      request_sample = {};
++    }
++  };
++
+   const auto& regs = register_file();
+ 
+   // Consume memory-watch invalidation *before* deciding whether skipping is
+@@ -510,12 +622,15 @@
+   // used constants need refreshing, avoid constructing vectors and the
+   // residency/bindings work. This does not suppress invalidation callbacks
+   // or fetch-constant writes.
+-  if (fast_path && (used_texture_mask & ~texture_bindings_in_sync_) == 0) {
++  const bool request_no_op =
++      (used_texture_mask & ~texture_bindings_in_sync_) == 0;
++  if (fast_path && request_no_op) {
+     static thread_local uint64_t no_op_skips = 0;
+     if ((++no_op_skips % UINT64_C(500000)) == 0) {
+       REXGPU_INFO("Texture fast path: {} confirmed no-op calls bypassed on this thread",
+                   no_op_skips);
+     }
++    finish_sample(true, true, {}, {}, {});
+     return;
+   }
+ 
+@@ -635,6 +750,7 @@
+   }
+ #endif
+   const auto stage_prepared = stage_probe ? StageClock::now() : StageClock::time_point{};
++  const auto sampled_prepared = sample_this ? SampleClock::now() : SampleClock::time_point{};
+   COUNT_profile_set("gpu/texture_cache/request_textures_pending_load_count",
+                     uint32_t(pending_texture_loads.size()));
+   COUNT_profile_set("gpu/texture_cache/request_textures_pending_range_count",
+@@ -667,6 +783,7 @@
+   }
+ 
+   const auto stage_resident = stage_probe ? StageClock::now() : StageClock::time_point{};
++  const auto sampled_resident = sample_this ? SampleClock::now() : SampleClock::time_point{};
+   if (batched_shared_memory_request_succeeded) {
+     for (const PendingTextureLoad& pending_load : pending_texture_loads) {
+       CommitPreparedTextureLoad(pending_load);
+@@ -679,6 +796,7 @@
+     }
+   }
+   const auto stage_uploaded = stage_probe ? StageClock::now() : StageClock::time_point{};
++  const auto sampled_uploaded = sample_this ? SampleClock::now() : SampleClock::time_point{};
+   if (bindings_changed) {
+     UpdateTextureBindingsImpl(bindings_changed);
+   }
+@@ -747,6 +865,8 @@
+       totals = {};
+     }
+   }
++  finish_sample(false, request_no_op, sampled_prepared, sampled_resident,
++                sampled_uploaded);
+ }
+ 
+ const char* TextureCache::TextureKey::GetLogDimensionName(xenos::DataDimension dimension) {
