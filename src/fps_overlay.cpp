@@ -136,7 +136,7 @@ class MclaFpsHud final : public rex::ui::ImGuiDialog {
       draw_reported = true;
     }
     const auto stats = MclaReadGuestFps();
-    const ImVec2 size(183.0f, 62.0f);
+    const ImVec2 size(220.0f, 81.0f);
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - size.x - 12.0f, 12.0f),
                             ImGuiCond_Always);
     ImGui::SetNextWindowSize(size, ImGuiCond_Always);
@@ -154,9 +154,10 @@ class MclaFpsHud final : public rex::ui::ImGuiDialog {
         ImGui::TextUnformatted("FPS  --");
         ImGui::TextDisabled("Measuring frames...");
       } else {
-        ImGui::Text("FPS  %.1f", stats.fps);
-        ImGui::TextDisabled("%.1f ms  |  max %.1f ms", stats.frame_time_ms,
-                            stats.worst_frame_ms);
+        ImGui::Text("FPS (0.5s avg)  %.1f", stats.fps);
+        ImGui::TextDisabled("Avg frame  %.1f ms", stats.frame_time_ms);
+        // A 90ms worst frame is a hitch (~11 FPS for that frame), not 90 FPS.
+        ImGui::TextDisabled("Worst frame  %.1f ms", stats.worst_frame_ms);
       }
     }
     ImGui::End();
