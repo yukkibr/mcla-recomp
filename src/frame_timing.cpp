@@ -324,6 +324,7 @@ static void RescaleCameraFactor(PPCRegister& reg) {
   // the 30 FPS factor in that case and the raw tune value otherwise.
   const float fps = ReadGuestFloat(kGuestFrameRate);
   TraceCameraRate(fps);
+  MclaCorrelateCameraFps(fps);
   const bool already_halved = static_cast<int>(fps + 0.5f) < 60;
   reg.f64 = PerFrameToContinuous(already_halved ? raw : 0.5 * raw, dt);
 }

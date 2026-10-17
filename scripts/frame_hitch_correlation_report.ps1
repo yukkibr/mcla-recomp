@@ -74,6 +74,12 @@ foreach ($file in $files) {
     $fixedCount = if ($hasStepTelemetry) { [long]$sum.fixed_calls } else { '--' }
     $fixedClamps = if ($hasStepTelemetry) { [long]$sum.fixed_clamps } else { '--' }
     $timerPeak = if ($hasStepTelemetry) { [math]::Round($maxTimerClipMs,2) } else { '--' }
+    $hasBurst = $sum.ContainsKey('host_over90') -and $sum.ContainsKey('camera_cross60')
+    $burst = @{}
+    foreach ($field in @('host_over60','host_over90','fast_after_stall','camera_rate_reads','camera_over60','camera_cross60','camera_cross_near_stall')) {
+        $burst[$field] = if ($hasBurst) { [long]$sum[$field] } else { '--' }
+    }
+    $peakCamera = if ($hasBurst) { [math]::Round(($rows | ForEach-Object { $_.Data.camera_peak_fps } | Measure-Object -Maximum).Maximum,1) } else { '--' }
     $fixedPeak = if ($hasStepTelemetry) { [math]::Round($maxFixedClipMs,2) } else { '--' }
     $relativeMean = if ($sum.relative_samples) { [math]::Round($weightedRelativeMm / $sum.relative_samples,1) } else { 0 }
     $totals += [pscustomobject]@{
@@ -97,6 +103,11 @@ foreach ($file in $files) {
         TimerClipMs=$timerClip; TimerMaxClipMs=$timerPeak
         FixedCalls=$fixedCount; FixedClamps=$fixedClamps
         FixedClipMs=$fixedClip; FixedMaxClipMs=$fixedPeak
+        Host60=$burst.host_over60; Host90=$burst.host_over90
+        PostStallFast=$burst.fast_after_stall; CameraReads=$burst.camera_rate_reads
+        CameraHigh=$burst.camera_over60; CameraCross60=$burst.camera_cross60
+        CameraCrossNear=$burst.camera_cross_near_stall
+        CameraPeakFps=$peakCamera
     }
     Write-Output "Per-window timing timeline: $name (first $SkipFirst windows skipped)"
     $rows | ForEach-Object {
@@ -117,6 +128,18 @@ foreach ($file in $files) {
             Offset05=[long]$x.relative_above_05m; Offset15=[long]$x.relative_above_15m
         }
     } | Format-Table -AutoSize | Out-String -Width 130 | Write-Output
+    if ($hasBurst) {
+        Write-Output "Per-window high-FPS / camera 60-band events: $name"
+        $rows | ForEach-Object {
+            $x = $_.Data
+            [pscustomobject]@{
+                At=$_.Time; Host60=[long]$x.host_over60
+                Host90=[long]$x.host_over90; AfterStall=[long]$x.fast_after_stall
+                CamCross=[long]$x.camera_cross60; CrossNear=[long]$x.camera_cross_near_stall
+                CamPeak=[math]::Round($x.camera_peak_fps,1)
+            }
+        } | Format-Table -AutoSize | Out-String -Width 150 | Write-Output
+    }
 }
 if (!$totals.Count) {
     Write-Output 'No completed correlation windows. Enable the correlation trial and play for at least 20 seconds.'
@@ -127,6 +150,8 @@ Write-Output 'Near means a camera event within 250ms AFTER a measured present ga
 Write-Output 'Camera jumps compare same rig/owner, <120ms between reads, >6m displacement; NPC transforms are NOT sampled.'
 Write-Output 'Relative offset is the vector difference between monitored camera rig and published camera; its change between successive comparable frames helps distinguish fixed offsets from motion.'
 Write-Output 'Relative05/15 count offset changes >0.5m / >1.5m (heuristic, not necessarily flick). No NPC transforms are sampled.'
+Write-Output 'Host60/90 count sub-16.667ms / sub-11.111ms guest presents, not an FPS average. CameraCross60 counts guest camera FPS-band switches during smoothing reads, not frames.'
+Write-Output 'PostStallFast counts a <16.667ms present immediately following a >=50ms present. A correlation is not evidence of cause.'
 Write-Output 'Presents and guest timer calls are different hooks; counters do not measure hardware GPU latency.'
 Write-Output 'Frame/guest summaries:'
 $totals | Select-Object Log,Windows,Presents,Over22Ms,Gap50,Gap100,MaxGapMs,Guest40,Guest67,Clamps |
@@ -141,3 +166,6 @@ Write-Output 'Measured duration withheld by each time-step guard (NOT additive a
 $totals | Select-Object Log,TimerClipMs,TimerMaxClipMs,FixedCalls,FixedClamps,FixedClipMs,FixedMaxClipMs |
     Format-Table -AutoSize | Out-String -Width 170 | Write-Output
 Write-Output 'The r8 and f11 paths may describe overlapping time. Never add their clipping totals to claim total lost gameplay time.'
+Write-Output 'Transient FPS and camera 60-FPS threshold comparisons:'
+$totals | Select-Object Log,Windows,Host60,Host90,PostStallFast,CameraReads,CameraHigh,CameraCross60,CameraCrossNear,CameraPeakFps |
+    Format-Table -AutoSize | Out-String -Width 190 | Write-Output

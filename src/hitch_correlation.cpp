@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 
 #include <rex/chrono/clock.h>
@@ -23,6 +24,14 @@ std::atomic<uint64_t> g_last_hitch_us{0};
 struct Stats {
   std::atomic<uint64_t> presents{0};
   std::atomic<uint64_t> slow_instant_45{0};
+  std::atomic<uint64_t> present_over_60{0};
+  std::atomic<uint64_t> present_over_90{0};
+  std::atomic<uint64_t> fast_after_stall{0};
+  std::atomic<uint64_t> camera_rate_reads{0};
+  std::atomic<uint64_t> camera_rate_over_60{0};
+  std::atomic<uint64_t> camera_60_crossings{0};
+  std::atomic<uint64_t> camera_60_near_stall{0};
+  std::atomic<uint64_t> camera_peak_fps_x100{0};
   std::atomic<uint64_t> gaps_50{0};
   std::atomic<uint64_t> gaps_100{0};
   std::atomic<uint64_t> max_gap_us{0};
@@ -80,6 +89,14 @@ void Report() {
   };
   const uint64_t presents = get(g_stats.presents);
   const uint64_t below45 = get(g_stats.slow_instant_45);
+  const uint64_t over60 = get(g_stats.present_over_60);
+  const uint64_t over90 = get(g_stats.present_over_90);
+  const uint64_t fast_after_stall = get(g_stats.fast_after_stall);
+  const uint64_t rate_reads = get(g_stats.camera_rate_reads);
+  const uint64_t camera_over60 = get(g_stats.camera_rate_over_60);
+  const uint64_t camera_cross60 = get(g_stats.camera_60_crossings);
+  const uint64_t camera_cross_near = get(g_stats.camera_60_near_stall);
+  const uint64_t camera_peak_fps = get(g_stats.camera_peak_fps_x100);
   const uint64_t gaps50 = get(g_stats.gaps_50);
   const uint64_t gaps100 = get(g_stats.gaps_100);
   const uint64_t max_gap = get(g_stats.max_gap_us);
@@ -122,7 +139,9 @@ void Report() {
       "relative_avg_mm={:.1f} relative_max_mm={} "
       "timer_clipped_ms={:.2f} timer_max_clip_ms={:.2f} "
       "fixed_calls={} fixed_clamps={} fixed_clipped_ms={:.2f} "
-      "fixed_max_clip_ms={:.2f}",
+      "fixed_max_clip_ms={:.2f} host_over60={} host_over90={} "
+      "fast_after_stall={} camera_rate_reads={} camera_over60={} "
+      "camera_cross60={} camera_cross_near_stall={} camera_peak_fps={:.1f}",
       presents, below45, gaps50, gaps100, double(max_gap) / 1000.0,
       timer, over40, over67, clamps, cam, long_cam, cam_jump,
       target_jump, cam_near, target_near, collisions, published,
@@ -131,7 +150,9 @@ void Report() {
       offset_samples ? double(offset_sum_mm) / double(offset_samples) : 0.0,
       offset_max_mm, double(timer_clipped_us) / 1000.0,
       double(timer_peak_us) / 1000.0, fixed_calls, fixed_clamps,
-      double(fixed_clipped_us) / 1000.0, double(fixed_peak_us) / 1000.0);
+      double(fixed_clipped_us) / 1000.0, double(fixed_peak_us) / 1000.0,
+      over60, over90, fast_after_stall, rate_reads, camera_over60,
+      camera_cross60, camera_cross_near, double(camera_peak_fps) / 100.0);
 }
 }  // namespace
 
@@ -141,8 +162,10 @@ bool MclaHitchCorrelationEnabled() {
 
 void MclaCorrelatePresent(uint64_t now_us, uint64_t interval_us) {
   thread_local uint64_t start_us = 0;
+  thread_local uint64_t previous_interval_us = 0;
   if (!MclaHitchCorrelationEnabled()) {
     start_us = 0;
+    previous_interval_us = 0;
     return;
   }
   if (!start_us) {
@@ -151,6 +174,12 @@ void MclaCorrelatePresent(uint64_t now_us, uint64_t interval_us) {
   }
   Increment(g_stats.presents);
   Increment(g_stats.slow_instant_45, interval_us > UINT64_C(22222));
+  Increment(g_stats.present_over_60, interval_us > 0 && interval_us < UINT64_C(16667));
+  Increment(g_stats.present_over_90, interval_us > 0 && interval_us < UINT64_C(11111));
+  Increment(g_stats.fast_after_stall,
+            previous_interval_us >= UINT64_C(50000) &&
+            interval_us > 0 && interval_us < UINT64_C(16667));
+  previous_interval_us = interval_us;
   if (interval_us >= UINT64_C(50000)) {
     Increment(g_stats.gaps_50);
     if (interval_us >= UINT64_C(100000)) Increment(g_stats.gaps_100);
@@ -161,6 +190,29 @@ void MclaCorrelatePresent(uint64_t now_us, uint64_t interval_us) {
     Report();
     start_us = now_us;
   }
+}
+
+void MclaCorrelateCameraFps(float guest_camera_fps) {
+  thread_local int previous_band = -1;
+  if (!MclaHitchCorrelationEnabled()) {
+    previous_band = -1;
+    return;
+  }
+  if (!std::isfinite(guest_camera_fps) || guest_camera_fps <= 0.0f ||
+      guest_camera_fps > 1000.0f) return;
+  const int band = static_cast<int>(guest_camera_fps + 0.5f) >= 60 ? 1 : 0;
+  Increment(g_stats.camera_rate_reads);
+  Increment(g_stats.camera_rate_over_60, band == 1);
+  UpdateMax(g_stats.camera_peak_fps_x100,
+            static_cast<uint64_t>(guest_camera_fps * 100.0f));
+  if (previous_band != -1 && previous_band != band) {
+    Increment(g_stats.camera_60_crossings);
+    const auto now_us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    Increment(g_stats.camera_60_near_stall, RecentlyHitch(now_us));
+  }
+  previous_band = band;
 }
 
 void MclaCorrelateGuestTimer(uint64_t measured_ticks, uint64_t applied_ticks) {
