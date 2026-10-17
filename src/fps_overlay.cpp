@@ -1,6 +1,7 @@
 // Lightweight, in-game FPS/frametime HUD.
 // Uses the existing ReXGlue ImGui presenter (no external window or DX12 hooks).
 #include "fps_overlay.h"
+#include "hitch_correlation.h"
 
 #include <array>
 #include <atomic>
@@ -177,6 +178,7 @@ void MclaRecordGuestPresent() {
   RecordBenchmarkGuestPresent(now);
   if (last_us && now > last_us) {
     const uint64_t delta = now - last_us;
+    MclaCorrelatePresent(now, delta);
     if (delta > peak_delta_us) {
       peak_delta_us = delta;
     }

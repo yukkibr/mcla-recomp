@@ -18,6 +18,7 @@ set(MCLA_SOURCES
     src/audio_fallback.cpp
     src/frame_timing.cpp
     src/motion_probe.cpp
+    src/hitch_correlation.cpp
     src/fps_overlay.cpp
     src/render_perf.cpp
     src/perf_options.cpp

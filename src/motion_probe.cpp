@@ -1,6 +1,7 @@
 // Read-only camera/target motion probe for rare vehicle + camera flick.
 // Only enabled with --mcla_motion_probe=true. No guest state is modified.
 #include "generated/default/mcla_init.h"
+#include "hitch_correlation.h"
 
 #include <algorithm>
 #include <array>
@@ -97,7 +98,7 @@ void FlushIfDue(uint64_t now) {
   if (now - g_summary.start_us < UINT64_C(5000000)) {
     return;
   }
-  if (g_summary.samples) {
+  if (g_summary.samples && REXCVAR_GET(mcla_motion_probe)) {
     REXLOG_INFO(
       "MCLA motion probe: {} camera updates, {} distinct rigs, target jumps {}, "
       "camera jumps {}, collision shifts {}, peak target {:.2f}m, "
@@ -107,7 +108,7 @@ void FlushIfDue(uint64_t now) {
       g_summary.peak_target_step, g_summary.peak_camera_step,
       g_summary.peak_collision_shift);
   }
-  if (g_summary.publish_samples) {
+  if (g_summary.publish_samples && REXCVAR_GET(mcla_motion_probe)) {
     REXLOG_INFO(
       "MCLA camera publish probe: {} matrix publishes, jumps {}, "
       "nearby-rig deviations {}, peak publish {:.2f}m, "
@@ -147,7 +148,7 @@ State& FindState(uint32_t cs, uint64_t now) {
 // sub_8231CE30 @0x8231CEE0, AFTER the optional camera collision passes.
 // Compare the updated rig target and final camera positions across ticks.
 void mcla_camera_motion_post(PPCRegister& r31) {
-  if (!REXCVAR_GET(mcla_motion_probe)) {
+  if (!REXCVAR_GET(mcla_motion_probe) && !MclaHitchCorrelationEnabled()) {
     return;
   }
   const uint32_t cs = r31.u32;
@@ -203,7 +204,12 @@ void mcla_camera_motion_post(PPCRegister& r31) {
   g_summary.target_jumps += jump_target;
   g_summary.camera_jumps += jump_camera;
   g_summary.collision_shifts += collision;
-  if ((jump_target || jump_camera || collision) && g_summary.event_logs < 4) {
+  const bool long_camera_gap = state.owner == owner && state.last_us &&
+      now > state.last_us && now - state.last_us >= UINT64_C(120000) &&
+      now - state.last_us <= UINT64_C(1000000);
+  MclaCorrelateCamera(now, jump_target, jump_camera, long_camera_gap, collision);
+  if (REXCVAR_GET(mcla_motion_probe) &&
+      (jump_target || jump_camera || collision) && g_summary.event_logs < 4) {
     const float delta_ms = comparable ? float(now-state.last_us)/1000.0f : 0.0f;
     REXLOG_INFO(
       "MCLA motion event: rig=0x{:08X} owner=0x{:08X} dt={:.1f}ms "
@@ -225,7 +231,7 @@ void mcla_camera_motion_post(PPCRegister& r31) {
 // game's camera state into the cine director/presentation pipeline.
 // Read only. This probe deliberately does NOT alter the camera matrix.
 void mcla_camera_motion_publish(PPCRegister& r30) {
-  if (!REXCVAR_GET(mcla_motion_probe)) {
+  if (!REXCVAR_GET(mcla_motion_probe) && !MclaHitchCorrelationEnabled()) {
     return;
   }
   const uint32_t matrix = r30.u32;
@@ -260,11 +266,13 @@ void mcla_camera_motion_publish(PPCRegister& r30) {
   const bool deviation = recent_rig && rig_difference > 3.0f;
   g_summary.publish_jumps += jump;
   g_summary.source_mismatches += deviation;
+  MclaCorrelatePublish(now, jump, deviation);
   g_summary.peak_publish_step = std::max(
       g_summary.peak_publish_step, published_step);
   g_summary.peak_source_difference = std::max(
       g_summary.peak_source_difference, rig_difference);
-  if ((jump || deviation) && g_publish_event_logs < 4) {
+  if (REXCVAR_GET(mcla_motion_probe) &&
+      (jump || deviation) && g_publish_event_logs < 4) {
     REXLOG_INFO(
       "MCLA camera publish event: matrix=0x{:08X}, delta {:.1f}ms, "
       "step {:.2f}m, to last updated rig {:.2f}m, recent rig {}",

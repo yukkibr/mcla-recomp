@@ -14,6 +14,7 @@
 
 #include "mcla_app.h"
 #include "fps_overlay.h"
+#include "hitch_correlation.h"
 
 #include <algorithm>
 #include <atomic>
@@ -247,6 +248,7 @@ void mcla_frame_delta(PPCRegister& r8) {
     r8.u64 = max_ticks;
   }
   TraceGuestFrameDelta(measured_ticks, r8.u64);
+  MclaCorrelateGuestTimer(measured_ticks, r8.u64);
 }
 
 bool mcla_use_real_delta() {
