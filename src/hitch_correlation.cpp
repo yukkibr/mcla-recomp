@@ -41,6 +41,12 @@ struct Stats {
   std::atomic<uint64_t> publish_jumps{0};
   std::atomic<uint64_t> rig_deviations{0};
   std::atomic<uint64_t> publish_near_hitch{0};
+  std::atomic<uint64_t> relative_samples{0};
+  std::atomic<uint64_t> relative_steps_05m{0};
+  std::atomic<uint64_t> relative_steps_15m{0};
+  std::atomic<uint64_t> relative_steps_near_gap{0};
+  std::atomic<uint64_t> relative_step_mm_sum{0};
+  std::atomic<uint64_t> relative_step_max_mm{0};
 } g_stats;
 
 void Increment(std::atomic<uint64_t>& count, bool condition = true) {
@@ -86,6 +92,12 @@ void Report() {
   const uint64_t pub_jump = get(g_stats.publish_jumps);
   const uint64_t deviations = get(g_stats.rig_deviations);
   const uint64_t pub_near = get(g_stats.publish_near_hitch);
+  const uint64_t offset_samples = get(g_stats.relative_samples);
+  const uint64_t offset05 = get(g_stats.relative_steps_05m);
+  const uint64_t offset15 = get(g_stats.relative_steps_15m);
+  const uint64_t offset_near = get(g_stats.relative_steps_near_gap);
+  const uint64_t offset_sum_mm = get(g_stats.relative_step_mm_sum);
+  const uint64_t offset_max_mm = get(g_stats.relative_step_max_mm);
 
   REXLOG_INFO(
       "MCLA hitch correlate: present={} intervals_above_22ms={} gap50={} "
@@ -93,11 +105,16 @@ void Report() {
       "clamps={} camera_updates={} long_camera_gaps={} camera_jumps={} "
       "target_jumps={} camera_near_gap={} target_near_gap={} "
       "collision_shifts={} matrix_publishes={} publish_jumps={} "
-      "rig_deviations={} publish_near_gap={}",
+      "rig_deviations={} publish_near_gap={} relative_samples={} "
+      "relative_above_05m={} relative_above_15m={} relative_near_gap={} "
+      "relative_avg_mm={:.1f} relative_max_mm={}",
       presents, below45, gaps50, gaps100, double(max_gap) / 1000.0,
       timer, over40, over67, clamps, cam, long_cam, cam_jump,
       target_jump, cam_near, target_near, collisions, published,
-      pub_jump, deviations, pub_near);
+      pub_jump, deviations, pub_near, offset_samples, offset05, offset15,
+      offset_near,
+      offset_samples ? double(offset_sum_mm) / double(offset_samples) : 0.0,
+      offset_max_mm);
 }
 }  // namespace
 
@@ -155,11 +172,23 @@ void MclaCorrelateCamera(uint64_t now_us, bool target_jump, bool camera_jump,
   }
 }
 
-void MclaCorrelatePublish(uint64_t now_us, bool matrix_jump, bool rig_deviation) {
+void MclaCorrelatePublish(uint64_t now_us, bool matrix_jump, bool rig_deviation,
+                          bool offset_comparable, float offset_change_m) {
   if (!MclaHitchCorrelationEnabled()) return;
   Increment(g_stats.published);
   Increment(g_stats.publish_jumps, matrix_jump);
   Increment(g_stats.rig_deviations, rig_deviation);
   Increment(g_stats.publish_near_hitch,
             matrix_jump && RecentlyHitch(now_us));
+  if (offset_comparable && offset_change_m >= 0.0f &&
+      offset_change_m < 1000000.0f) {
+    const uint64_t mm = static_cast<uint64_t>(offset_change_m * 1000.0f);
+    Increment(g_stats.relative_samples);
+    Increment(g_stats.relative_steps_05m, offset_change_m > 0.5f);
+    Increment(g_stats.relative_steps_15m, offset_change_m > 1.5f);
+    Increment(g_stats.relative_steps_near_gap,
+              offset_change_m > 1.5f && RecentlyHitch(now_us));
+    g_stats.relative_step_mm_sum.fetch_add(mm, std::memory_order_relaxed);
+    UpdateMax(g_stats.relative_step_max_mm, mm);
+  }
 }

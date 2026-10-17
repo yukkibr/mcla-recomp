@@ -31,7 +31,15 @@ foreach ($file in $files) {
     if (!$rows.Count) { continue }
     $sum = @{}
     $max = 0.0
+    $maxRelativeMm = 0.0
+    $weightedRelativeMm = 0.0
     foreach ($row in $rows) {
+        if ($row.Data.ContainsKey('relative_samples') -and $row.Data.ContainsKey('relative_avg_mm')) {
+            $weightedRelativeMm += $row.Data.relative_samples * $row.Data.relative_avg_mm
+        }
+        if ($row.Data.ContainsKey('relative_max_mm')) {
+            $maxRelativeMm = [math]::Max($maxRelativeMm, $row.Data.relative_max_mm)
+        }
         foreach ($key in $row.Data.Keys) {
             if ($key -eq 'max_gap_ms') {
                 $max = [math]::Max($max, $row.Data[$key])
@@ -42,6 +50,7 @@ foreach ($file in $files) {
         }
     }
     $name = $file.Name
+    $relativeMean = if ($sum.relative_samples) { [math]::Round($weightedRelativeMm / $sum.relative_samples,1) } else { 0 }
     $totals += [pscustomobject]@{
         Log=$name; Windows=$rows.Count; Presents=[long]$sum.present
         Over22Ms=[long]$sum.intervals_above_22ms; Gap50=[long]$sum.gap50
@@ -54,6 +63,12 @@ foreach ($file in $files) {
         PublishJumps=[long]$sum.publish_jumps
         PublishNear=[long]$sum.publish_near_gap
         RigDeviations=[long]$sum.rig_deviations
+        RelativeSamples=[long]$sum.relative_samples
+        Relative05=[long]$sum.relative_above_05m
+        Relative15=[long]$sum.relative_above_15m
+        RelativeNear=[long]$sum.relative_near_gap
+        RelativeMeanMm=$relativeMean
+        RelativeMaxMm=[math]::Round($maxRelativeMm,0)
     }
     Write-Output "Per-window hitch timeline: $name (first $SkipFirst windows skipped)"
     $rows | ForEach-Object {
@@ -62,6 +77,7 @@ foreach ($file in $files) {
             At=$_.Time; Gap50=[long]$x.gap50; Gap100=[long]$x.gap100
             Clamps=[long]$x.clamps; Camera=[long]$x.camera_jumps
             Target=[long]$x.target_jumps; Publish=[long]$x.publish_jumps
+            Offset05=[long]$x.relative_above_05m; Offset15=[long]$x.relative_above_15m
         }
     } | Format-Table -AutoSize | Out-String -Width 160 | Write-Output
 }
@@ -72,6 +88,8 @@ if (!$totals.Count) {
 Write-Output 'Read-only temporal association, NOT causal proof. Above22ms is an instantaneous interval proxy for below 45 FPS.'
 Write-Output 'Near means a camera event within 250ms AFTER a measured present gap >=50ms.'
 Write-Output 'Camera jumps compare same rig/owner, <120ms between reads, >6m displacement; NPC transforms are NOT sampled.'
+Write-Output 'Relative offset is the vector difference between monitored camera rig and published camera; its change between successive comparable frames helps distinguish fixed offsets from motion.'
+Write-Output 'Relative05/15 count offset changes >0.5m / >1.5m (heuristic, not necessarily flick). No NPC transforms are sampled.'
 Write-Output 'Presents and guest timer calls are different hooks; counters do not measure hardware GPU latency.'
 Write-Output 'Frame/guest summaries:'
 $totals | Select-Object Log,Windows,Presents,Over22Ms,Gap50,Gap100,MaxGapMs,Guest40,Guest67,Clamps |
@@ -79,3 +97,6 @@ $totals | Select-Object Log,Windows,Presents,Over22Ms,Gap50,Gap100,MaxGapMs,Gues
 Write-Output 'Camera/publish correlation summaries:'
 $totals | Select-Object Log,CameraSamples,LongCameraGap,CameraJumps,TargetJumps,CameraNear,TargetNear,PublishJumps,PublishNear,RigDeviations |
     Format-Table -AutoSize | Out-String -Width 200 | Write-Output
+Write-Output 'Relative camera-to-render offset changes:'
+$totals | Select-Object Log,RelativeSamples,Relative05,Relative15,RelativeNear,RelativeMeanMm,RelativeMaxMm |
+    Format-Table -AutoSize | Out-String -Width 160 | Write-Output

@@ -56,6 +56,12 @@ thread_local Vec3 g_last_rig_camera{};
 thread_local uint64_t g_last_rig_time_us = 0;
 thread_local Vec3 g_last_published_camera{};
 thread_local uint64_t g_last_publish_time_us = 0;
+// Track changes in the camera-to-render-source offset, not only its
+// absolute distance (which can legitimately exceed 3m in chase cameras).
+thread_local uint32_t g_last_rig_id = 0;
+thread_local uint32_t g_previous_relative_rig_id = 0;
+thread_local Vec3 g_previous_relative_offset{};
+thread_local uint64_t g_previous_relative_time_us = 0;
 thread_local uint32_t g_publish_event_logs = 0;
 
 uint64_t NowUs() {
@@ -225,6 +231,7 @@ void mcla_camera_motion_post(PPCRegister& r31) {
   // A candidate for matching the camera passed to the render pipeline.
   g_last_rig_camera = camera;
   g_last_rig_time_us = now;
+  g_last_rig_id = cs;
 }
 
 // sub_8220AA68 @0x8220AA88: r30 points to the matrix passed from the
@@ -266,7 +273,28 @@ void mcla_camera_motion_publish(PPCRegister& r30) {
   const bool deviation = recent_rig && rig_difference > 3.0f;
   g_summary.publish_jumps += jump;
   g_summary.source_mismatches += deviation;
-  MclaCorrelatePublish(now, jump, deviation);
+  bool comparable_offset = false;
+  float relative_step = 0.0f;
+  if (recent_rig && MclaHitchCorrelationEnabled()) {
+    const Vec3 current_offset{published.x - g_last_rig_camera.x,
+                              published.y - g_last_rig_camera.y,
+                              published.z - g_last_rig_camera.z};
+    comparable_offset = g_last_rig_id &&
+        g_previous_relative_rig_id == g_last_rig_id &&
+        g_previous_relative_time_us &&
+        now > g_previous_relative_time_us &&
+        now - g_previous_relative_time_us < UINT64_C(120000);
+    if (comparable_offset) {
+      relative_step = Distance(current_offset, g_previous_relative_offset);
+    }
+    g_previous_relative_offset = current_offset;
+    g_previous_relative_time_us = now;
+    g_previous_relative_rig_id = g_last_rig_id;
+  } else {
+    g_previous_relative_time_us = 0;
+    g_previous_relative_rig_id = 0;
+  }
+  MclaCorrelatePublish(now, jump, deviation, comparable_offset, relative_step);
   g_summary.peak_publish_step = std::max(
       g_summary.peak_publish_step, published_step);
   g_summary.peak_source_difference = std::max(
