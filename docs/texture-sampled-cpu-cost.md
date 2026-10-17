@@ -13,9 +13,14 @@ Keep this experimental work out of main.
   highest per-window p99 bucket 48 ms, maximum interval 592.5 ms,
   13 frames >=50 ms, 2 >=100 ms. 5 million synchronized requests
   were bypassed over the full run.
-- Different window counts and no deterministic playback:
-  neither the small FPS difference nor the isolated max stalls
-  prove gain or regression from the fast path.
+- The revised report can now compare an equal number of windows:
+  texture_ab_report.ps1 -SkipFirst 3 -MaxWindows 7.
+  Matched first 7 windows (~70.1s per mode): OFF 40.01 FPS,
+  12 events >=50ms, 2 >=100ms; ON 39.93 FPS,
+  11 events >=50ms, 2 >=100ms; worst p99 bucket 48ms both.
+  Isolated maximum intervals still differ (492.2ms vs 592.5ms).
+  Since this is not deterministic playback, these differences
+  still do NOT prove gain or regression from the fast path.
 - Both modes showed the same invalid texture-fetch warning
   and normal QUIT GAME. DX12 scissor cache: ~99% reuse.
 - Heavy texture-stage probe OFF: the precise CPU reason for
