@@ -9,6 +9,7 @@
 
 #include <imgui.h>
 #include <rex/cvar.h>
+#include <rex/logging.h>
 #include <rex/ui/imgui_dialog.h>
 #include <rex/ui/imgui_drawer.h>
 
@@ -35,6 +36,13 @@ class MclaFpsHud final : public rex::ui::ImGuiDialog {
   void OnDraw(ImGuiIO& io) override {
     if (!REXCVAR_GET(mcla_show_fps)) {
       return;
+    }
+    // Verify that the HUD is actually reaching the ImGui paint path, not
+    // merely that the saved CVar was loaded. Log once, not on every frame.
+    static bool draw_reported = false;
+    if (!draw_reported) {
+      REXLOG_INFO("MCLA FPS COUNTER HUD render path active");
+      draw_reported = true;
     }
     const auto stats = MclaReadGuestFps();
     const ImVec2 size(183.0f, 62.0f);

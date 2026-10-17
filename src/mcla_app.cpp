@@ -61,6 +61,10 @@ void MclaApp::OnPreSetup(rex::RuntimeConfig& config) {
 
 void MclaApp::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
   fps_overlay_ = MclaCreateFpsHud(drawer);
+  // Confirms the CVar actually loaded at startup, independently of
+  // whether the ImGui HUD itself is currently visible.
+  REXLOG_INFO("MCLA FPS COUNTER startup preference: {}",
+              rex::cvar::GetFlagByName("mcla_show_fps"));
 }
 
 void MclaApp::OnShutdown() {

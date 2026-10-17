@@ -652,6 +652,11 @@ int ItemCurrentIndex(const ItemDef& item) {
 
 std::atomic<bool> g_settings_dirty{false};
 
+// The FPS overlay is a player-facing display preference, not a benchmark
+// probe. Save it as soon as the checkbox changes so it also survives leaving
+// the game without navigating back through the settings menu.
+void SaveSettingsIfChanged();
+
 void ItemSetIndex(const ItemDef& item, int index) {
   if (index < 0 || index >= ItemValueCount(item)) {
     return;
@@ -671,6 +676,9 @@ void ItemSetIndex(const ItemDef& item, int index) {
     }
   }
   g_settings_dirty.store(true, std::memory_order_relaxed);
+  if (std::strcmp(item.option, "mcla_show_fps") == 0) {
+    SaveSettingsIfChanged();
+  }
 }
 
 // --- Rows --------------------------------------------------------------------
