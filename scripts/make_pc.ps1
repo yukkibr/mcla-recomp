@@ -179,6 +179,12 @@ try {
         Patch "sdk-patch-texture-stage" $sdk "$root\patches\rexglue-dx12-texture-stage-probe.patch"
         (Get-Item "$sdk\.mcla-patched" -Force).LastWriteTime = Get-Date
     }
+    # Opt-in, correctness-preserving fast no-op bypass and reusable texture
+    # request lists; keep the SDK's original invalidation processing intact.
+    if (-not (Select-String -Quiet -SimpleMatch "texture_request_fast_path" "$sdk\src\graphics\pipeline\texture\cache.cpp")) {
+        Patch "sdk-patch-texture-fastpath" $sdk "$root\patches\rexglue-texture-request-fast-path.patch"
+        (Get-Item "$sdk\.mcla-patched" -Force).LastWriteTime = Get-Date
+    }
     # Opt-in bounded D3D12 resource reuse pool, disabled by default.
     if (-not (Select-String -Quiet -SimpleMatch "resource_pool_limit_bytes_" "$sdk\include\rex\graphics\d3d12\texture_cache.h")) {
         Patch "sdk-patch-resource-pool" $sdk "$root\patches\rexglue-dx12-resource-pool.patch"

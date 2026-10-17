@@ -1,0 +1,104 @@
+diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
+--- a/src/graphics/pipeline/texture/cache.cpp
++++ b/src/graphics/pipeline/texture/cache.cpp
+@@ -31,6 +31,12 @@
+ 
+ // Supplemental to d3d12_hitch_probe: stages of CPU texture requests.
+ // OFF by default; no new caches, uploads, texture state or GPU sync.
++// This only skips requests if *all* used texture fetch constants are
++// already synchronized and no texture-memory watch has invalidated them.
++REXCVAR_DEFINE_BOOL(texture_request_fast_path, false, "GPU",
++                    "Avoid redundant texture request setup and reuse temporary load vectors")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ REXCVAR_DEFINE_BOOL(dx12_texture_stage_probe, false, "GPU",
+                     "Measure texture binding/prep, guest residency and upload CPU costs")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+@@ -475,11 +481,23 @@
+ }
+ 
+ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
++  const bool fast_path = REXCVAR_GET(texture_request_fast_path);
++  if (fast_path) {
++    static thread_local bool enabled_reported = false;
++    if (!enabled_reported) {
++      REXGPU_INFO("Texture fast path enabled: synced no-op bypass + reusable request vectors");
++      enabled_reported = true;
++    }
++  }
+   const bool stage_probe = REXCVAR_GET(dx12_texture_stage_probe);
+   using StageClock = std::chrono::steady_clock;
+   const auto stage_start = stage_probe ? StageClock::now() : StageClock::time_point{};
+   const auto& regs = register_file();
+ 
++  // Consume memory-watch invalidation *before* deciding whether skipping is
++  // possible. ResetTextureBindings notifies the graphics backend and also
++  // clears texture_bindings_in_sync_; no texture is ever assumed up to date
++  // just because its fetch constant did not change.
+   if (texture_became_outdated_.exchange(false, std::memory_order_acquire)) {
+     // A texture has become outdated - make sure whether textures are outdated
+     // is rechecked in this draw and in subsequent ones to reload the new data
+@@ -487,10 +505,32 @@
+     ResetTextureBindings();
+   }
+ 
+-  // Update the texture keys and the textures.
++  // The original loop below only visits fetch constants not in sync, and
++  // uploads / bindings depend entirely on those visits. If *none* of the
++  // used constants need refreshing, avoid constructing vectors and the
++  // residency/bindings work. This does not suppress invalidation callbacks
++  // or fetch-constant writes.
++  if (fast_path && (used_texture_mask & ~texture_bindings_in_sync_) == 0) {
++    static thread_local uint64_t no_op_skips = 0;
++    if ((++no_op_skips % UINT64_C(500000)) == 0) {
++      REXGPU_INFO("Texture fast path: {} confirmed no-op calls bypassed on this thread",
++                  no_op_skips);
++    }
++    return;
++  }
++
++  // Update the texture keys and the textures. In fast mode the scratch
++  // vectors belong to this cache instance, not the graphics thread: this
++  // avoids frequent heap allocations without reusing another cache's data.
+   uint32_t bindings_changed = 0;
+-  std::vector<PendingTextureLoad> pending_texture_loads;
+-  std::vector<PendingSharedMemoryRange> pending_shared_memory_ranges;
++  std::vector<PendingTextureLoad> pending_texture_loads_local;
++  std::vector<PendingSharedMemoryRange> pending_shared_memory_ranges_local;
++  auto& pending_texture_loads =
++      fast_path ? pending_texture_loads_scratch_ : pending_texture_loads_local;
++  auto& pending_shared_memory_ranges =
++      fast_path ? pending_shared_memory_ranges_scratch_ : pending_shared_memory_ranges_local;
++  pending_texture_loads.clear();
++  pending_shared_memory_ranges.clear();
+   auto queue_pending_texture_load = [&](Texture* texture) {
+     if (texture == nullptr) {
+       return;
+@@ -601,7 +641,10 @@
+                     uint32_t(pending_shared_memory_ranges.size()));
+ 
+   bool batched_shared_memory_request_succeeded = true;
+-  std::vector<std::pair<uint32_t, uint32_t>> pending_shared_memory_range_pairs;
++  std::vector<std::pair<uint32_t, uint32_t>> pending_shared_memory_range_pairs_local;
++  auto& pending_shared_memory_range_pairs =
++      fast_path ? pending_range_pairs_scratch_ : pending_shared_memory_range_pairs_local;
++  pending_shared_memory_range_pairs.clear();
+   if (!pending_shared_memory_ranges.empty()) {
+     pending_shared_memory_range_pairs.reserve(pending_shared_memory_ranges.size());
+     for (const PendingSharedMemoryRange& pending_range : pending_shared_memory_ranges) {
+diff --git a/include/rex/graphics/pipeline/texture/cache.h b/include/rex/graphics/pipeline/texture/cache.h
+--- a/include/rex/graphics/pipeline/texture/cache.h
++++ b/include/rex/graphics/pipeline/texture/cache.h
+@@ -557,6 +557,12 @@
+     uint32_t start = 0;
+     uint32_t length = 0;
+   };
++  // Solely used inside the GPU Commands thread's non-reentrant
++  // RequestTextures. Never shared between different texture-cache objects.
++  std::vector<PendingTextureLoad> pending_texture_loads_scratch_;
++  std::vector<PendingSharedMemoryRange> pending_shared_memory_ranges_scratch_;
++  std::vector<std::pair<uint32_t, uint32_t>> pending_range_pairs_scratch_;
++
+   bool PrepareTextureLoad(Texture& texture, PendingTextureLoad& pending_load_out,
+                           PendingSharedMemoryRange* pending_ranges_out,
+                           size_t& pending_range_count_out);
