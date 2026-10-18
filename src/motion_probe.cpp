@@ -18,6 +18,13 @@ REXCVAR_DEFINE_BOOL(mcla_motion_probe, false, "MCLA",
                     "Sample camera target, camera position and collision corrections to locate visual jumps")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// In addition to the existing 10s aggregate, inspect the identity of the
+// published matrix and the most recently updated chase camera rig. Logging
+// only happens on meaningful discontinuities, plus a bounded follow-up.
+REXCVAR_DEFINE_BOOL(mcla_camera_publish_trace, false, "MCLA",
+                    "Read-only camera publish matrix/rig identity trace on large visual steps")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace {
 struct Vec3 {
   float x, y, z;
@@ -59,10 +66,37 @@ thread_local uint64_t g_last_publish_time_us = 0;
 // Track changes in the camera-to-render-source offset, not only its
 // absolute distance (which can legitimately exceed 3m in chase cameras).
 thread_local uint32_t g_last_rig_id = 0;
+thread_local uint32_t g_last_rig_owner = 0;
 thread_local uint32_t g_previous_relative_rig_id = 0;
 thread_local Vec3 g_previous_relative_offset{};
 thread_local uint64_t g_previous_relative_time_us = 0;
 thread_local uint32_t g_publish_event_logs = 0;
+
+// Per-GPU-present thread, not shared across renderer or simulation threads.
+// Only read the same validated data already sampled by the camera probe.
+struct PublishIdentityStats {
+  uint64_t start_us = 0;
+  uint32_t previous_matrix = 0;
+  uint32_t previous_rig_id = 0;
+  uint32_t previous_rig_owner = 0;
+  uint32_t samples = 0;
+  uint32_t source_changes = 0;
+  uint32_t rig_changes = 0;
+  uint32_t owner_changes = 0;
+  uint32_t long_steps_same_source = 0;
+  uint32_t long_steps_new_source = 0;
+  uint32_t long_steps_stable_rig = 0;
+  uint32_t long_steps_unpaired_rig = 0;
+  uint32_t offset_steps_same_source = 0;
+  uint32_t offset_steps_new_source = 0;
+  uint32_t unpaired_rig = 0;
+  uint32_t events_logged = 0;
+  uint32_t follow_logs = 0;
+  uint32_t follow_remaining = 0;
+  float max_step_m = 0.0f;
+  float max_offset_step_m = 0.0f;
+};
+thread_local PublishIdentityStats g_identity{};
 
 uint64_t NowUs() {
   return uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
@@ -154,7 +188,8 @@ State& FindState(uint32_t cs, uint64_t now) {
 // sub_8231CE30 @0x8231CEE0, AFTER the optional camera collision passes.
 // Compare the updated rig target and final camera positions across ticks.
 void mcla_camera_motion_post(PPCRegister& r31) {
-  if (!REXCVAR_GET(mcla_motion_probe) && !MclaHitchCorrelationEnabled()) {
+  if (!REXCVAR_GET(mcla_motion_probe) && !MclaHitchCorrelationEnabled() &&
+      !REXCVAR_GET(mcla_camera_publish_trace)) {
     return;
   }
   const uint32_t cs = r31.u32;
@@ -232,13 +267,15 @@ void mcla_camera_motion_post(PPCRegister& r31) {
   g_last_rig_camera = camera;
   g_last_rig_time_us = now;
   g_last_rig_id = cs;
+  g_last_rig_owner = owner;
 }
 
 // sub_8220AA68 @0x8220AA88: r30 points to the matrix passed from the
 // game's camera state into the cine director/presentation pipeline.
 // Read only. This probe deliberately does NOT alter the camera matrix.
 void mcla_camera_motion_publish(PPCRegister& r30) {
-  if (!REXCVAR_GET(mcla_motion_probe) && !MclaHitchCorrelationEnabled()) {
+  if (!REXCVAR_GET(mcla_motion_probe) && !MclaHitchCorrelationEnabled() &&
+      !REXCVAR_GET(mcla_camera_publish_trace)) {
     return;
   }
   const uint32_t matrix = r30.u32;
@@ -275,7 +312,8 @@ void mcla_camera_motion_publish(PPCRegister& r30) {
   g_summary.source_mismatches += deviation;
   bool comparable_offset = false;
   float relative_step = 0.0f;
-  if (recent_rig && MclaHitchCorrelationEnabled()) {
+  if (recent_rig && (MclaHitchCorrelationEnabled() ||
+                     REXCVAR_GET(mcla_camera_publish_trace))) {
     const Vec3 current_offset{published.x - g_last_rig_camera.x,
                               published.y - g_last_rig_camera.y,
                               published.z - g_last_rig_camera.z};
@@ -295,6 +333,109 @@ void mcla_camera_motion_publish(PPCRegister& r30) {
     g_previous_relative_rig_id = 0;
   }
   MclaCorrelatePublish(now, jump, deviation, comparable_offset, relative_step);
+  // This trace deliberately retains each matrix pointer and camera rig ID
+  // separately. A matrix pointer may stay constant while cinematic camera
+  // ownership changes, and a pointer change alone is not a bug.
+  if (REXCVAR_GET(mcla_camera_publish_trace)) {
+    auto& s = g_identity;
+    if (!s.start_us) {
+      s.start_us = now;
+      REXLOG_INFO("MCLA camera identity trace active: read-only, matrix and rig IDs");
+    }
+    if (now - s.start_us >= UINT64_C(10000000)) {
+      REXLOG_INFO(
+          "MCLA camera identity summary: samples={} matrix_switches={} "
+          "rig_switches={} owner_switches={} jump_same_matrix={} "
+          "jump_switched_matrix={} jump_stable_rig={} jump_unpaired_rig={} "
+          "offset_same_matrix={} offset_switched_matrix={} "
+          "unpaired_rig={} max_step_m={:.2f} "
+          "max_offset_m={:.2f}",
+          s.samples, s.source_changes, s.rig_changes, s.owner_changes,
+          s.long_steps_same_source, s.long_steps_new_source,
+          s.long_steps_stable_rig, s.long_steps_unpaired_rig,
+          s.offset_steps_same_source, s.offset_steps_new_source,
+          s.unpaired_rig, s.max_step_m, s.max_offset_step_m);
+      // Retain identities across windows so boundary frame comparisons still
+      // distinguish switches. Only the aggregate counters reset.
+      const uint32_t prev_matrix = s.previous_matrix;
+      const uint32_t prev_rig = s.previous_rig_id;
+      const uint32_t prev_owner = s.previous_rig_owner;
+      const uint32_t remaining = s.follow_remaining;
+      s = {};
+      s.start_us = now;
+      s.previous_matrix = prev_matrix;
+      s.previous_rig_id = prev_rig;
+      s.previous_rig_owner = prev_owner;
+      s.follow_remaining = remaining;
+    }
+    const bool source_switched = s.previous_matrix &&
+                                 s.previous_matrix != matrix;
+    const bool rig_switched = recent_rig && s.previous_rig_id &&
+                              s.previous_rig_id != g_last_rig_id;
+    const bool owner_switched = recent_rig && s.previous_rig_owner &&
+                                s.previous_rig_owner != g_last_rig_owner;
+    // Stable means we observed the same rig AND its owner in consecutive
+    // publish samples; the first frame of a scene cannot meet this rule.
+    const bool stable_rig = recent_rig && s.previous_rig_id &&
+                            s.previous_rig_owner && !rig_switched &&
+                            !owner_switched;
+    ++s.samples;
+    s.source_changes += source_switched;
+    s.rig_changes += rig_switched;
+    s.owner_changes += owner_switched;
+    s.unpaired_rig += !recent_rig;
+    s.max_step_m = std::max(s.max_step_m, published_step);
+    s.max_offset_step_m = std::max(s.max_offset_step_m, relative_step);
+    s.long_steps_same_source += jump && !source_switched;
+    s.long_steps_new_source += jump && source_switched;
+    s.long_steps_stable_rig += jump && stable_rig;
+    s.long_steps_unpaired_rig += jump && !stable_rig;
+    s.offset_steps_same_source += comparable_offset &&
+                                  relative_step > 1.5f && !source_switched;
+    s.offset_steps_new_source += comparable_offset &&
+                                 relative_step > 1.5f && source_switched;
+    const bool event = jump || (comparable_offset && relative_step > 1.5f);
+    if (event && s.events_logged < 6) {
+      REXLOG_INFO(
+          "MCLA camera identity event: src=0x{:08X} prev_src=0x{:08X} "
+          "source_switch={} stable_rig={} rig=0x{:08X} prev_rig=0x{:08X} "
+          "rig_switch={} owner=0x{:08X} prev_owner=0x{:08X} "
+          "owner_switch={} matched_rig={} dt_ms={:.2f} "
+          "publish_step_m={:.3f} relative_step_m={:.3f} "
+          "rig_offset_m={:.3f} prev_xyz=({:.2f},{:.2f},{:.2f}) "
+          "published_xyz=({:.2f},{:.2f},{:.2f})",
+          matrix, s.previous_matrix, source_switched, stable_rig,
+          recent_rig ? g_last_rig_id : 0u, s.previous_rig_id,
+          rig_switched, recent_rig ? g_last_rig_owner : 0u,
+          s.previous_rig_owner, owner_switched, recent_rig,
+          comparable ? double(now-g_last_publish_time_us)/1000.0 : 0.0,
+          published_step, relative_step, rig_difference,
+          g_last_published_camera.x, g_last_published_camera.y,
+          g_last_published_camera.z, published.x, published.y, published.z);
+      ++s.events_logged;
+      s.follow_remaining = 3;
+    } else if (s.follow_remaining) {
+      if (s.follow_logs < 12) {
+        REXLOG_INFO(
+            "MCLA camera identity follow: src=0x{:08X} rig=0x{:08X} "
+            "dt_ms={:.2f} step_m={:.3f} relative_step_m={:.3f} "
+            "camera_xyz=({:.2f},{:.2f},{:.2f})",
+            matrix, recent_rig ? g_last_rig_id : 0u,
+            comparable ? double(now-g_last_publish_time_us)/1000.0 : 0.0,
+            published_step, relative_step, published.x, published.y, published.z);
+        ++s.follow_logs;
+      }
+      --s.follow_remaining;
+    }
+    s.previous_matrix = matrix;
+    if (recent_rig) {
+      s.previous_rig_id = g_last_rig_id;
+      s.previous_rig_owner = g_last_rig_owner;
+    }
+  } else if (g_identity.start_us) {
+    // A hot-reloaded OFF must not compare against stale identities next time.
+    g_identity = {};
+  }
   g_summary.peak_publish_step = std::max(
       g_summary.peak_publish_step, published_step);
   g_summary.peak_source_difference = std::max(
