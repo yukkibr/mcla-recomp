@@ -1,5 +1,6 @@
 # Automated test for the normal window close lifecycle, no in-game inputs.
 param([int]$WarmupSeconds = 12, [int]$TimeoutSeconds = 25, [string[]]$ExtraArgs = @(),
+      [ValidateSet('d3d12','vulkan')][string]$Backend = 'd3d12',
       [switch]$UseConfiguredFps)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
@@ -15,7 +16,7 @@ public static class QuitQA {
 "@
 $argsList = @(
  "--game_data_root=$root\game", '--gpu_plugin=xenos',
- '--mcla_gpu_backend=d3d12', '--fullscreen=false',
+ "--mcla_gpu_backend=$Backend", '--fullscreen=false',
  '--mcla_intro=fast',
  "--log_file=$log", '--log_level=info'
 )
