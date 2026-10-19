@@ -53,6 +53,47 @@ out/runs/quit-qa-20261018-233628.log
 
 DX12 is still the default and still the safe fallback.
 
+## Results from actual Windows road test (23:47-23:49, 2026-10-18)
+
+The user tested both backends in the city and observed fewer FPS
+and much more stuttering in Vulkan. Logs under ignored
+out/backend-trials confirm this direction:
+
+- DX12 mcla-d3d12-20261018-234701.log: gameplay 10-second
+  windows included 32.09, 45.00 and 41.48 guest presents/s;
+  the two latter windows had 0-1 >=100ms gaps.
+- Vulkan mcla-vulkan-20261018-234811.log: gameplay windows
+  included 14.87, 26.87, 14.88, 31.59 and 27.50
+  guest presents/s; multiple 100+ms stalls, including a
+  1480.91ms maximum presentation-request interval.
+- Vulkan also logged incomplete shader/pipeline-frame
+  presentation skipping, which makes guest-present FPS
+  unreliable as displayed GPU FPS. The user reported worse
+  actual gameplay feel as well.
+- Windows GPU: NVIDIA GeForce RTX 5060 Ti, CPU Xeon
+  E5-2670 v3. Runs were not route-identical controlled A/B/A,
+  so these figures support the user's practical choice,
+  not a universal claim that DX12 beats Vulkan on all systems.
+
+**Decision:** DX12 remains the supported preferred backend.
+Do not make Vulkan default or invest in its optimization for
+this particular PC in the next performance phase.
+
+Local-only mcla.toml is explicitly set to
+mcla_gpu_backend = "d3d12". Two opt-in CPU traces are OFF
+for normal gameplay: texture_request_sample_probe and
+mcla_hitch_correlation. The HUD and lightweight guest FPS
+benchmark remain ON for normal testing. These preference
+changes alone are not a measured FPS boost. Restore detailed
+tracing only for a bounded troubleshooting session.
+
+Next target: inspect *per-draw translation overhead* in the
+DX12 GPU Commands thread (state changes, binding updates,
+texture references, and draw dispatch), especially sustained
+thousands of draw calls/frame on the older Xeon.
+Avoid changing vehicle simulation, visuals, collision or FPS
+cap while optimizing the CPU render path.
+
 ## Reversible backend trial
 
 Use scripts/gpu_backend_trial.ps1. It only sets a command-line
