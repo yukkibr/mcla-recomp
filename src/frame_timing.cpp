@@ -81,6 +81,12 @@ REXCVAR_DEFINE_BOOL(mcla_timing_trace, false, "MCLA",
                     "Log guest frame delta and camera FPS threshold transitions (5s summaries)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// Read-only: distinguish game timer, measured physics-step timer path and
+// host present-command cadence, without touching any guest transformations.
+REXCVAR_DEFINE_BOOL(mcla_sim_present_sync_probe, false, "MCLA",
+                    "Correlate guest timer, fixed-step path and present requests (diagnostic only)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(mcla_skip_intro, false, "MCLA",
                     "Skip the intro movies. Side effect: the title screen loses its logo");
 
@@ -118,6 +124,121 @@ uint64_t NowMicros() {
 // Only read when diagnostics are explicitly enabled; no GPU or CSV counters.
 std::atomic<uint32_t> g_camera_fps_hundredths{0};
 std::atomic<uint64_t> g_camera_60fps_crossings{0};
+
+// Approximate cross-thread sequencing, not a physics transform sampler.
+// Sequence numbers and timestamps are sampled only when the probe is ON.
+std::atomic<uint64_t> g_sync_timer_seq{0};
+std::atomic<uint64_t> g_sync_fixed_seq{0};
+std::atomic<uint64_t> g_sync_timer_last_us{0};
+std::atomic<uint64_t> g_sync_fixed_last_us{0};
+std::atomic<uint64_t> g_sync_timer_clipped_count{0};
+std::atomic<uint64_t> g_sync_timer_clipped_us{0};
+
+void TrackSimTimer(uint64_t raw_ticks, uint64_t applied_ticks) {
+  if (!REXCVAR_GET(mcla_sim_present_sync_probe)) return;
+  const uint64_t now = NowMicros();
+  g_sync_timer_last_us.store(now, std::memory_order_relaxed);
+  g_sync_timer_seq.fetch_add(1, std::memory_order_relaxed);
+  if (raw_ticks > applied_ticks) {
+    const double frequency = double(rex::chrono::Clock::guest_tick_frequency());
+    if (frequency > 0.0) {
+      const auto lost = static_cast<uint64_t>(
+          double(raw_ticks - applied_ticks) * 1000000.0 / frequency);
+      g_sync_timer_clipped_us.fetch_add(lost, std::memory_order_relaxed);
+      g_sync_timer_clipped_count.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+}
+
+void TrackSimFixedStep() {
+  if (!REXCVAR_GET(mcla_sim_present_sync_probe)) return;
+  g_sync_fixed_last_us.store(NowMicros(), std::memory_order_relaxed);
+  g_sync_fixed_seq.fetch_add(1, std::memory_order_relaxed);
+}
+
+void TrackSimPresent() {
+  struct Window {
+    uint64_t start_us = 0;
+    uint64_t previous_fixed = 0;
+    uint64_t previous_timer = 0;
+    uint64_t previous_clip_count = 0;
+    uint64_t previous_clip_us = 0;
+    uint32_t presents = 0;
+    uint32_t no_new_fixed = 0;
+    uint32_t multi_fixed = 0;
+    uint32_t no_new_timer = 0;
+    uint32_t age_over_50 = 0;
+    uint32_t age_over_100 = 0;
+    uint32_t unpaired = 0;
+    uint32_t events_logged = 0;
+    uint64_t age_sum_us = 0;
+    uint64_t age_max_us = 0;
+  };
+  static thread_local Window w{};
+  if (!REXCVAR_GET(mcla_sim_present_sync_probe)) {
+    w = {};
+    return;
+  }
+  const uint64_t now = NowMicros();
+  const uint64_t fixed = g_sync_fixed_seq.load(std::memory_order_relaxed);
+  const uint64_t timer = g_sync_timer_seq.load(std::memory_order_relaxed);
+  const uint64_t fixed_at = g_sync_fixed_last_us.load(std::memory_order_relaxed);
+  if (!w.start_us) {
+    w.start_us = now;
+    w.previous_fixed = fixed;
+    w.previous_timer = timer;
+    w.previous_clip_count = g_sync_timer_clipped_count.load(std::memory_order_relaxed);
+    w.previous_clip_us = g_sync_timer_clipped_us.load(std::memory_order_relaxed);
+    REXLOG_INFO("MCLA sim/present sync probe active: measures callbacks, not NPC positions");
+    return;
+  }
+  const uint64_t advanced = fixed - w.previous_fixed;
+  const uint64_t timer_advanced = timer - w.previous_timer;
+  const bool age_known = fixed_at && now >= fixed_at && now - fixed_at < UINT64_C(10000000);
+  const uint64_t age = age_known ? now - fixed_at : 0;
+  ++w.presents;
+  w.no_new_fixed += advanced == 0;
+  w.multi_fixed += advanced > 1;
+  w.no_new_timer += timer_advanced == 0;
+  w.unpaired += !age_known;
+  if (age_known) {
+    w.age_sum_us += age;
+    w.age_max_us = std::max(w.age_max_us, age);
+    w.age_over_50 += age >= UINT64_C(50000);
+    w.age_over_100 += age >= UINT64_C(100000);
+  }
+  if (age_known && age >= UINT64_C(80000) && w.events_logged < 5) {
+    ++w.events_logged;
+    REXLOG_INFO("MCLA sim/present sync lag: fixed_age_ms={:.2f} "
+                "new_fixed={} new_timer={} total_fixed={} total_timer={}",
+                double(age) / 1000.0, advanced, timer_advanced, fixed, timer);
+  }
+  w.previous_fixed = fixed;
+  w.previous_timer = timer;
+  if (now - w.start_us >= UINT64_C(10000000)) {
+    const uint64_t clips = g_sync_timer_clipped_count.load(std::memory_order_relaxed);
+    const uint64_t clipped_us = g_sync_timer_clipped_us.load(std::memory_order_relaxed);
+    const uint64_t start_fixed = fixed;
+    const uint64_t start_timer = timer;
+    const auto age_mean = w.presents > w.unpaired ?
+        double(w.age_sum_us) / (1000.0 * double(w.presents - w.unpaired)) : 0.0;
+    REXLOG_INFO("MCLA sim/present sync: presents={} no_new_fixed={} multi_fixed={} "
+                "no_new_timer={} age_mean_ms={:.2f} age_peak_ms={:.2f} "
+                "age50={} age100={} unpaired={} timer_clamps={} "
+                "timer_clipped_ms={:.2f} fixed_seq={} timer_seq={}",
+                w.presents, w.no_new_fixed, w.multi_fixed, w.no_new_timer,
+                age_mean, double(w.age_max_us) / 1000.0, w.age_over_50,
+                w.age_over_100, w.unpaired, clips - w.previous_clip_count,
+                double(clipped_us - w.previous_clip_us) / 1000.0,
+                fixed, timer);
+    w = {};
+    w.start_us = now;
+    w.previous_fixed = start_fixed;
+    w.previous_timer = start_timer;
+    w.previous_clip_count = clips;
+    w.previous_clip_us = clipped_us;
+  }
+}
 
 void TraceCameraRate(float fps) {
   if (!REXCVAR_GET(mcla_timing_trace) || !std::isfinite(fps) || fps < 0.0f) {
@@ -377,6 +498,7 @@ void mcla_frame_delta(PPCRegister& r8) {
   }
   TraceGuestFrameDelta(measured_ticks, r8.u64);
   MclaCorrelateGuestTimer(measured_ticks, r8.u64);
+  TrackSimTimer(measured_ticks, r8.u64);
 }
 
 bool mcla_use_real_delta() {
@@ -395,6 +517,7 @@ void mcla_fixed_step_path(PPCRegister& r3, PPCRegister& f11) {
     const double applied_delta = std::min(measured_delta, MaxGuestFrameSeconds());
     f11.f64 = applied_delta;
     MclaCorrelateFixedStep(measured_delta, applied_delta);
+    TrackSimFixedStep();
   }
 }
 
@@ -422,6 +545,7 @@ static void PaceUnlimitedSwap() {
 bool mcla_present_interval(PPCRegister& r11) {
   // Actual guest present requests, not target FPS and not an SDK profiler.
   MclaRecordGuestPresent();
+  TrackSimPresent();
   if (OriginalTiming()) {
     return false;
   }
