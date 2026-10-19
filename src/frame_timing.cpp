@@ -45,6 +45,15 @@ REXCVAR_DEFINE_INT32(mcla_fps, 30, "MCLA",
                      "-1 restores the game's original fixed 30 Hz timing")
     .range(-1, 240);
 
+// Camera-only A/B diagnostic: the original Xbox filter moves a fixed
+// fraction each update (tuned for 30Hz); our time-corrected filter rescales
+// that fraction for the real frame duration. Neither mode changes FPS,
+// frame pacing, the real-time guest timer, chassis or vehicle physics.
+REXCVAR_DEFINE_STRING(mcla_camera_smoothing_mode, "time_corrected", "MCLA",
+                      "Camera filter A/B: time_corrected (default) or per_frame (native factor)")
+    .allowed({"time_corrected", "per_frame"})
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 // Limit the maximum guest time step when a texture streaming or CPU stall
 // produces a very late frame. This limits simulation jumps but cannot make
 // the host render faster; smaller caps may cause brief slow-motion instead.
@@ -444,6 +453,13 @@ static void RescaleCameraFactor(PPCRegister& reg) {
   const float fps = ReadGuestFloat(kGuestFrameRate);
   TraceCameraRate(fps);
   MclaCorrelateCameraFps(fps);
+  // Isolated test for the remaining small chase-camera flicks above 30fps:
+  // leave the game's unmodified per-frame coefficient in place. This
+  // purposely makes the filter stronger at >30fps, unlike the corrected
+  // time-continuous formula. Do not change the other fixed-step safeguards.
+  if (REXCVAR_GET(mcla_camera_smoothing_mode) == "per_frame") {
+    return;
+  }
   const bool already_halved = static_cast<int>(fps + 0.5f) < 60;
   reg.f64 = PerFrameToContinuous(already_halved ? raw : 0.5 * raw, dt);
 }
@@ -499,4 +515,6 @@ void MclaApp::ConfigureFrameTiming() {
               "max guest step {} ms",
               REXCVAR_GET(mcla_fps), rex::cvar::GetFlagByName("vsync"),
               REXCVAR_GET(mcla_frame_stall_guard_ms));
+  REXLOG_INFO("MCLA chase camera filter A/B: mode={} (does not cap FPS)",
+              REXCVAR_GET(mcla_camera_smoothing_mode));
 }
