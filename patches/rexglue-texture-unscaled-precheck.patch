@@ -1,0 +1,83 @@
+diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
+index 0d9b738..7b51f2f 100644
+--- a/src/graphics/pipeline/texture/cache.cpp
++++ b/src/graphics/pipeline/texture/cache.cpp
+@@ -37,6 +37,14 @@ REXCVAR_DEFINE_BOOL(texture_request_fast_path, false, "GPU",
+                     "Avoid redundant texture request setup and reuse temporary load vectors")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++// An exact-key texture that is already in the per-device cache is valid
++// without repeating the host-extent normalization. Apply only without
++// internal draw scaling, where the key cannot gain a scaled-resolve flag.
++// Cache misses and oversized/rebased textures still take the original path.
++REXCVAR_DEFINE_BOOL(texture_precheck_unscaled_cache, false, "GPU",
++                    "Experimental early exact-key cache lookup for unscaled textures")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ // Opt-in sparse CPU instrumentation: one in 257 calls is timed, and all
+ // counters are thread-local. No texture, GPU, binding, or cache changes.
+ REXCVAR_DEFINE_BOOL(texture_request_sample_probe, false, "GPU",
+@@ -1038,6 +1046,30 @@ void TextureCache::DestroyAllTextures(bool from_destructor) {
+ }
+ 
+ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
++  // The same cache and hash are used later in this method. On the common
++  // unscaled path, an *existing* exact-key texture can be returned before
++  // dimension checks and normalization; cache misses fall through unchanged.
++  // Never shortcut scaled resolves because their cache key depends on
++  // whether guest pages contain scaled resolve data at the time of access.
++  const bool unscaled_precheck =
++      REXCVAR_GET(texture_precheck_unscaled_cache) && !IsDrawResolutionScaled();
++  if (unscaled_precheck) {
++    static thread_local uint64_t attempts = 0;
++    static thread_local uint64_t hits = 0;
++    ++attempts;
++    auto early_hit = textures_.find(key);
++    const bool found = early_hit != textures_.end();
++    hits += found;
++    // First checkpoint confirms activation; afterwards keep logging rare
++    // enough that logging itself cannot dominate a measured CPU frame.
++    if (attempts == UINT64_C(5000) || attempts % UINT64_C(250000) == 0) {
++      REXGPU_INFO("Texture unscaled precheck: {} exact lookups, {} hits ({:.1f}%)",
++                  attempts, hits, 100.0 * double(hits) / double(attempts));
++    }
++    if (found) {
++      return early_hit->second.get();
++    }
++  }
+   // Check if the texture is a scaled resolve texture.
+   if (IsDrawResolutionScaled() && key.tiled && IsScaledResolveSupportedForFormat(key)) {
+     texture_util::TextureGuestLayout scaled_resolve_guest_layout = key.GetGuestLayout();
+@@ -1107,7 +1139,9 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
+   get_host_extent(host_width, host_height, host_depth_or_array_size);
+   // If the host can't support the full texture extent, first try using the
+   // unscaled version of a scaled resolve texture, then fall back to the first
+-  // stored mip level only.
++  // stored mip level only. Track key changes so a prechecked initial miss can
++  // still find a normalized texture, preserving the original cache semantics.
++  bool adjusted_key = false;
+   uint32_t max_host_width_height = GetMaxHostTextureWidthHeight(key.dimension);
+   uint32_t max_host_depth_or_array_size = GetMaxHostTextureDepthOrArraySize(key.dimension);
+   while (true) {
+@@ -1129,15 +1163,18 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
+     if (!size_adjusted) {
+       return nullptr;
+     }
++    adjusted_key = true;
+     get_host_extent(host_width, host_height, host_depth_or_array_size);
+   }
+ 
+   // Try to find an existing texture.
+   // TODO(Triang3l): Reuse a texture with mip_page unchanged, but base_page
+   // previously 0, now not 0, to save memory - common case in streaming.
+-  auto found_texture_it = textures_.find(key);
+-  if (found_texture_it != textures_.end()) {
+-    return found_texture_it->second.get();
++  if (!unscaled_precheck || adjusted_key) {
++    auto found_texture_it = textures_.find(key);
++    if (found_texture_it != textures_.end()) {
++      return found_texture_it->second.get();
++    }
+   }
+ 
+   // Create the texture and add it to the map.

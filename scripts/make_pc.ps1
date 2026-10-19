@@ -66,6 +66,15 @@ function PatchTexturePoolProbe([string]$repo, [string]$patch) {
     Logged "sdk-patch-resource-pool-probe" { git -C $repo apply --ignore-whitespace $patch }
 }
 
+# Incremental patch against the already customized, Windows-formatted SDK
+# texture cache. Relax whitespace context only for this selected patch.
+function PatchTextureUnscaledPrecheck([string]$repo, [string]$patch) {
+    $ErrorActionPreference = "Continue"
+    git -C $repo apply --reverse --check --ignore-whitespace $patch 2>&1 | Out-Null
+    if ($LASTEXITCODE -eq 0) { "already applied: $(Split-Path $patch -Leaf)"; return }
+    Logged "sdk-patch-texture-unscaled-precheck" { git -C $repo apply --ignore-whitespace $patch }
+}
+
 Push-Location $root
 try {
     # -----------------------------------------------------------------------
@@ -199,6 +208,12 @@ try {
     # independent from the heavier per-request stage timer.
     if (-not (Select-String -Quiet -SimpleMatch 'texture_request_sample_probe' "$sdk\src\graphics\pipeline\texture\cache.cpp")) {
         Patch 'sdk-patch-texture-sample' $sdk "$root\patches\rexglue-texture-sampled-cpu-cost.patch"
+        (Get-Item "$sdk\.mcla-patched" -Force).LastWriteTime = Get-Date
+    }
+    # Optional exact-key hit before redundant host size normalization.
+    # Only applies if draw scaling is disabled and does not bypass invalidation.
+    if (-not (Select-String -Quiet -SimpleMatch "texture_precheck_unscaled_cache" "$sdk\src\graphics\pipeline\texture\cache.cpp")) {
+        PatchTextureUnscaledPrecheck $sdk "$root\patches\rexglue-texture-unscaled-precheck.patch"
         (Get-Item "$sdk\.mcla-patched" -Force).LastWriteTime = Get-Date
     }
     # Opt-in bounded D3D12 resource reuse pool, disabled by default.
