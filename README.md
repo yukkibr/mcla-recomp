@@ -24,6 +24,68 @@ Static recompilation of *Midnight Club: Los Angeles Complete Edition* (Xbox 360,
 | PS5 (jailbroken) | Plays: career, races, garage, saves, audio and controller, at a steady 30 FPS on a PS5 Pro (firmware 13.42), where the zoomed-out map runs at 20 to 25. Also tested on a PS5 Slim (firmware 12.70), installed from scratch with the one-command build, where it runs well; frame rates were measured on the Pro only. Car reflections fixed, confirmed on a console. Build and install with one command: `docs/ps5-build-guide.md`. |
 
 Details and open problems: `docs/known-issues.md`.
+## YukkiBR fork: active Windows development
+
+This fork keeps **main** as the stable upstream-compatible base. Ongoing
+Windows improvements live in **[development](https://github.com/yukkibr/mcla-recomp/tree/development)**.
+The features below describe that branch, **not the binaries or code currently
+shipped in main**. Experiments are not advertised as proven speedups.
+
+### Improvements available on development
+
+| Area | Implementation and validation |
+|---|---|
+| PC display | Optional spatial AMD FidelityFX FSR, native/render-size presets, tunable city/traffic density, and a persistent FPS overlay. This is **spatial FSR**, not validated temporal FSR 3.1. |
+| Session stability | Reliable QUIT GAME via the window-close path; boot/exit smoke tests performed on Windows. |
+| Frame timing | Real elapsed-time guest simulation at unlocked frame rates, a configurable catch-up guard, and **time-corrected chase-camera smoothing**. A camera A/B showed fewer large matrix jumps with time correction; minor flicks still occur. |
+| DirectX 12/ReXGlue | Patched ReXGlue 0.10.0 with audited scissor-state caching, texture-request Fast Path, experimental bounded GPU-resource pooling, and build-time FidelityFX integration. |
+| Profiling | Guest-present FPS/frame-gap metrics; opt-in GPU Commands CPU, texture preparation/upload, camera matrix, and timer-stall reports. Diagnostic CPU overhead is documented and optional. |
+
+**Observed, not guaranteed:** city driving on one test PC often produces
+roughly 30-45 guest presents per second, with occasional higher readings and
+sporadic stutters. Guest-present requests are not necessarily displayed frames
+or true GPU frame times. There is **no confirmed sustained FPS increase** from
+the optional DX12 texture pool or unscaled texture precheck; both remain
+reversible experiments. Visual correctness and original driving physics take
+priority over benchmark numbers.
+
+### Roadmap
+
+| Phase | Scope | State |
+|---|---|---|
+| **1 - Foundation** | Source fork, SDK/build toolchain, game launch, repeatable Windows tests | Completed |
+| **2 - Display and scaling** | Resolution presets, spatial FSR, FPS HUD, exit and quality-of-life corrections | Implemented; continued validation |
+| **3 - Temporal reconstruction** | Real motion vectors, depth and jitter; then assess temporal FSR 3.x / DLSS (without fake inputs) | Research / not yet implemented |
+| **4 - Frame-time consistency** | Optimize Xenos command processing, texture creation/streaming, shader pipelines, CPU/GPU synchronization and small camera stutters | In progress |
+
+Next milestones include reproducible same-route A/B/A benchmarks,
+GPU/CPU stage attribution, correctness-first texture-cache improvements,
+and evaluation of Vulkan only after the renderer is stable and compatible.
+Frame generation is **not a short-term target** until simulation and
+motion-vector correctness are established.
+
+### Branch policy and testing
+
+- **main:** stable upstream-compatible branch. Gameplay changes are
+  promoted here only after driving tests and review.
+- **development:** single integration branch for Windows improvements
+  and optional experimental features; avoid piling up topic branches.
+- Local rollback copies and game configurations stay outside Git commits.
+  The repository never contains game assets or user saves.
+
+To try the in-progress Windows work with your own legally obtained game:
+
+~~~powershell
+git fetch origin
+git switch development
+.\scripts\make_pc.ps1 -FidelityFX
+~~~
+
+For first-time setup, see the [PC build guide](docs/pc-build-guide.md)
+and supply your own disc image. Build tools, SDK patch notes and detailed
+experiment reports live on the development branch. Some settings need a
+game restart; **unlocked FPS** is selectable, not a promise of stable 60 FPS.
+
 
 ## Which release of the game
 
