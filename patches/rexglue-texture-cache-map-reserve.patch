@@ -1,0 +1,122 @@
+diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
+index 7b51f2f..08a2b86 100644
+--- a/src/graphics/pipeline/texture/cache.cpp
++++ b/src/graphics/pipeline/texture/cache.cpp
+@@ -45,6 +45,16 @@ REXCVAR_DEFINE_BOOL(texture_precheck_unscaled_cache, false, "GPU",
+                     "Experimental early exact-key cache lookup for unscaled textures")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++// Reserving the cache hash buckets avoids map-wide rehashes during city
++// texture streaming; it never retains additional texture resources by itself.
++REXCVAR_DEFINE_INT32(texture_cache_map_reserve, 0, "GPU",
++                     "Experimental initial hash-map bucket capacity for texture cache (0=off)")
++    .range(0, 32768)
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++REXCVAR_DEFINE_BOOL(texture_cache_map_probe, false, "GPU",
++                    "Measure texture creation and cache map insertion/rehash CPU time")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ // Opt-in sparse CPU instrumentation: one in 257 calls is timed, and all
+ // counters are thread-local. No texture, GPU, binding, or cache changes.
+ REXCVAR_DEFINE_BOOL(texture_request_sample_probe, false, "GPU",
+@@ -244,6 +254,15 @@ TextureCache::TextureCache(const RegisterFile& register_file, SharedMemory& shar
+   assert_true(draw_resolution_scale_y >= 1);
+   assert_true(draw_resolution_scale_y <= kMaxDrawResolutionScaleAlongAxis);
+ 
++  const int32_t cache_map_capacity = REXCVAR_GET(texture_cache_map_reserve);
++  if (cache_map_capacity > 0) {
++    // Reserve buckets only: do not construct textures, change texture
++    // invalidation, increase GPU memory or modify the guest layout.
++    textures_.reserve(static_cast<size_t>(cache_map_capacity));
++    REXGPU_INFO("Texture cache map reserve: entries={} buckets={}",
++                cache_map_capacity, textures_.bucket_count());
++  }
++
+   if (draw_resolution_scale_x > 1 || draw_resolution_scale_y > 1) {
+     constexpr uint32_t kScaledResolvePageDwordCount = SharedMemory::kBufferSize / 4096 / 32;
+     scaled_resolve_pages_ = std::unique_ptr<uint32_t[]>(new uint32_t[kScaledResolvePageDwordCount]);
+@@ -1177,16 +1196,83 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
+     }
+   }
+ 
+-  // Create the texture and add it to the map.
++  // Create the texture and add it to the map. The optional map probe
++  // measures the expensive miss path only; hot cache hits are untouched.
++  const bool map_probe = REXCVAR_GET(texture_cache_map_probe);
++  using MapClock = std::chrono::steady_clock;
++  const auto create_start = map_probe ? MapClock::now() : MapClock::time_point{};
+   Texture* texture;
++  uint64_t create_us = 0;
++  uint64_t insert_us = 0;
++  bool map_rehashed = false;
+   {
+     std::unique_ptr<Texture> new_texture = CreateTexture(key);
++    if (map_probe) {
++      create_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
++          MapClock::now() - create_start).count());
++    }
+     if (!new_texture) {
+       key.LogAction("Failed to create");
+       return nullptr;
+     }
+     assert_true(new_texture->key() == key);
++    const size_t previous_buckets = map_probe ? textures_.bucket_count() : 0;
++    const auto insert_start = map_probe ? MapClock::now() : MapClock::time_point{};
+     texture = textures_.emplace(key, std::move(new_texture)).first->second.get();
++    if (map_probe) {
++      insert_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
++          MapClock::now() - insert_start).count());
++      map_rehashed = textures_.bucket_count() != previous_buckets;
++    }
++  }
++  if (map_probe) {
++    // Cumulative sample for the single GPU Commands thread. No per-texture
++    // dynamic allocation or extra mapping/locking is performed by this probe.
++    struct MapStats {
++      MapClock::time_point started{};
++      uint64_t creates = 0;
++      uint64_t creation_us = 0;
++      uint64_t insertion_us = 0;
++      uint64_t creation_peak_us = 0;
++      uint64_t insertion_peak_us = 0;
++      uint32_t rehashes = 0;
++      uint32_t slow_creates = 0;
++      uint32_t slow_inserts = 0;
++      uint32_t events_logged = 0;
++    };
++    static thread_local MapStats stats{};
++    const auto now = MapClock::now();
++    if (stats.started == MapClock::time_point{}) stats.started = now;
++    ++stats.creates;
++    stats.creation_us += create_us;
++    stats.insertion_us += insert_us;
++    stats.creation_peak_us = std::max(stats.creation_peak_us, create_us);
++    stats.insertion_peak_us = std::max(stats.insertion_peak_us, insert_us);
++    stats.rehashes += map_rehashed;
++    stats.slow_creates += create_us >= UINT64_C(5000);
++    stats.slow_inserts += insert_us >= UINT64_C(5000);
++    if ((map_rehashed || create_us >= UINT64_C(5000) ||
++         insert_us >= UINT64_C(5000)) && stats.events_logged < 8) {
++      ++stats.events_logged;
++      REXGPU_INFO("Texture cache map event: create_ms={:.2f} insert_ms={:.2f} "
++                  "rehash={} live={} buckets={}",
++                  double(create_us) / 1000.0, double(insert_us) / 1000.0,
++                  map_rehashed, textures_.size(), textures_.bucket_count());
++    }
++    if (now - stats.started >= std::chrono::seconds(10)) {
++      REXGPU_INFO("Texture cache map stats: creates={} create_cpu_ms={:.2f} "
++                  "create_peak_ms={:.2f} insert_cpu_ms={:.2f} "
++                  "insert_peak_ms={:.2f} rehashes={} slow_create={} "
++                  "slow_insert={} live={} buckets={}",
++                  stats.creates, double(stats.creation_us) / 1000.0,
++                  double(stats.creation_peak_us) / 1000.0,
++                  double(stats.insertion_us) / 1000.0,
++                  double(stats.insertion_peak_us) / 1000.0,
++                  stats.rehashes, stats.slow_creates, stats.slow_inserts,
++                  textures_.size(), textures_.bucket_count());
++      stats = {};
++      stats.started = now;
++    }
+   }
+   COUNT_profile_set("gpu/texture_cache/textures", textures_.size());
+   texture->LogAction("Created");
