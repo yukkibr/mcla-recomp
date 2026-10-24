@@ -1,0 +1,125 @@
+diff --git a/include/rex/graphics/pipeline/texture/cache.h b/include/rex/graphics/pipeline/texture/cache.h
+--- a/include/rex/graphics/pipeline/texture/cache.h
++++ b/include/rex/graphics/pipeline/texture/cache.h
+@@ -538,6 +538,9 @@
+   // this will cause another attempt to create a texture or to untile it if
+   // there was an error.
+   void ResetTextureBindings(bool from_destructor = false);
++  // Optimized handling of memory-watch dirtiness only: do not call from
++  // texture eviction, BeginFrame or other authoritative full-reset sites.
++  void ResetOnlyOutdatedTextureBindings();
+ 
+   const TextureBinding* GetValidTextureBinding(uint32_t fetch_constant_index) const {
+     const TextureBinding& binding = texture_bindings_[fetch_constant_index];
+@@ -627,6 +630,7 @@
+   uint32_t texture_bindings_in_sync_ = 0;
+   // Read-only during draw processing; evaluated once at TextureCache creation.
+   bool texture_quick_sync_enabled_ = false;
++  bool texture_selective_invalidation_enabled_ = false;
+ };
+ 
+ }  // namespace rex::graphics
+diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
+--- a/src/graphics/pipeline/texture/cache.cpp
++++ b/src/graphics/pipeline/texture/cache.cpp
+@@ -46,6 +46,18 @@
+ REXCVAR_DEFINE_BOOL(texture_request_quick_sync, false, "GPU",
+                     "Fast return for already-synchronized texture request batches")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++
++// Normal ReXGlue texture watchers invalidate ALL 32 fetch bindings when even
++// one texture changes. This experiment selectively invalidates only bindings
++// referencing watched, outdated textures. Retain the authoritative full reset
++// for scaled resolves, explicit cache eviction, failed allocations and all
++// other existing ResetTextureBindings callsites.
++REXCVAR_DEFINE_BOOL(texture_watch_selective_invalidation, false, "GPU",
++                    "Experimental selectively refresh dirty texture bindings")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++REXCVAR_DEFINE_BOOL(texture_watch_selective_stats, false, "GPU",
++                    "Sparse statistics on selectively refreshed bindings")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
+ // An exact-key texture that is already in the per-device cache is valid
+ // without repeating the host-extent normalization. Apply only without
+@@ -260,6 +272,11 @@
+       draw_resolution_scale_x_(draw_resolution_scale_x),
+       draw_resolution_scale_y_(draw_resolution_scale_y) {
+   texture_quick_sync_enabled_ = REXCVAR_GET(texture_request_quick_sync);
++  texture_selective_invalidation_enabled_ =
++      REXCVAR_GET(texture_watch_selective_invalidation);
++  if (texture_selective_invalidation_enabled_) {
++    REXGPU_INFO("Texture translation: selective dirty watch invalidation enabled");
++  }
+   if (texture_quick_sync_enabled_) {
+     REXGPU_INFO("Texture translation: synchronized-request quick path enabled");
+   }
+@@ -663,10 +680,14 @@
+   // clears texture_bindings_in_sync_; no texture is ever assumed up to date
+   // just because its fetch constant did not change.
+   if (texture_became_outdated_.exchange(false, std::memory_order_acquire)) {
+-    // A texture has become outdated - make sure whether textures are outdated
+-    // is rechecked in this draw and in subsequent ones to reload the new data
+-    // if needed.
+-    ResetTextureBindings();
++    // Keep all of the original invalidation and retry guarantees; restrict
++    // selective handling to unscaled guest textures, where a memory-watch
++    // callback has already set the per-texture outdated bitmask.
++    if (texture_selective_invalidation_enabled_ && !IsDrawResolutionScaled()) {
++      ResetOnlyOutdatedTextureBindings();
++    } else {
++      ResetTextureBindings();
++    }
+   }
+ 
+   // The original loop below only visits fetch constants not in sync, and
+@@ -1415,6 +1436,50 @@
+   }
+ }
+ 
++void TextureCache::ResetOnlyOutdatedTextureBindings() {
++  uint32_t dirty_bindings = 0;
++  uint32_t considered = 0;
++  for (size_t i = 0; i < texture_bindings_.size(); ++i) {
++    TextureBinding& binding = texture_bindings_[i];
++    if (!binding.key.is_valid) {
++      continue;
++    }
++    ++considered;
++    // The guest memory watches mark outdated bits before notifying the cache.
++    // An explicitly failed binding is also retried, as in the original
++    // ResetTextureBindings, rather than becoming permanently stuck.
++    bool dirty = (binding.texture && binding.texture->outdated_mask()) ||
++                 (binding.texture_signed && binding.texture_signed->outdated_mask()) ||
++                 (!binding.texture && !binding.texture_signed);
++    if (!dirty) {
++      continue;
++    }
++    const uint32_t index_bit = UINT32_C(1) << i;
++    binding.Reset();
++    dirty_bindings |= index_bit;
++  }
++  // Preserve all other binding descriptors, cached keys, signedness and
++  // residency. Changes will be resolved by the usual RequestTextures loop.
++  texture_bindings_in_sync_ &= ~dirty_bindings;
++  if (dirty_bindings) {
++    UpdateTextureBindingsImpl(dirty_bindings);
++  }
++  if (REXCVAR_GET(texture_watch_selective_stats)) {
++    struct Stats {
++      uint64_t events = 0, inspected = 0, refreshed = 0;
++    };
++    static thread_local Stats stats{};
++    ++stats.events;
++    stats.inspected += considered;
++    stats.refreshed += rex::bit_count(dirty_bindings);
++    if ((stats.events & UINT64_C(511)) == 0) {
++      REXGPU_INFO("Texture selective invalidation: {} events, {} bindings inspected, "
++                  "{} bindings refreshed vs. full reset (cumulative)",
++                  stats.events, stats.inspected, stats.refreshed);
++    }
++  }
++}
++
+ void TextureCache::ResetTextureBindings(bool from_destructor) {
+   uint32_t bindings_reset = 0;
+   for (size_t i = 0; i < texture_bindings_.size(); ++i) {

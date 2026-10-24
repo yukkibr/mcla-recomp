@@ -84,6 +84,24 @@ function PatchScissorQuiet([string]$repo, [string]$patch) {
     Logged "sdk-patch-scissor-quiet" { git -C $repo apply --ignore-whitespace $patch }
 }
 
+# Indexed texture synchronization and tracked 3D fetch wrappers. Apply after
+# existing texture request fast path patches and preserve all local SDK edits.
+function PatchTextureTranslationFastPaths([string]$repo, [string]$patch) {
+    $ErrorActionPreference = "Continue"
+    git -C $repo apply --reverse --check --ignore-whitespace $patch 2>&1 | Out-Null
+    if ($LASTEXITCODE -eq 0) { "already applied: $(Split-Path $patch -Leaf)"; return }
+    Logged "sdk-patch-texture-translation-fastpaths" { git -C $repo apply --ignore-whitespace $patch }
+}
+
+# Further optional texture watch optimization. Keep a full-reset fallback for
+# scaled resolves, explicit eviction and any faulted path.
+function PatchTextureSelectiveInvalidation([string]$repo, [string]$patch) {
+    $ErrorActionPreference = "Continue"
+    git -C $repo apply --reverse --check --ignore-whitespace $patch 2>&1 | Out-Null
+    if ($LASTEXITCODE -eq 0) { "already applied: $(Split-Path $patch -Leaf)"; return }
+    Logged "sdk-patch-texture-selective-watch" { git -C $repo apply --ignore-whitespace $patch }
+}
+
 # Incremental, opt-in texture cache hashmap preallocation/creation timing.
 function PatchTextureMapReserve([string]$repo, [string]$patch) {
     $ErrorActionPreference = "Continue"
@@ -231,6 +249,20 @@ try {
     # independent from the heavier per-request stage timer.
     if (-not (Select-String -Quiet -SimpleMatch 'texture_request_sample_probe' "$sdk\src\graphics\pipeline\texture\cache.cpp")) {
         Patch 'sdk-patch-texture-sample' $sdk "$root\patches\rexglue-texture-sampled-cpu-cost.patch"
+        (Get-Item "$sdk\.mcla-patched" -Force).LastWriteTime = Get-Date
+    }
+    # Two opt-in, synchronous texture translation hotpaths. No asynchronous
+    # GPU work, no memory residency bypass, no change to format conversion.
+    if (-not (Select-String -Quiet -SimpleMatch 'texture_request_quick_sync' "$sdk\src\graphics\pipeline\texture\cache.cpp") -or
+        -not (Select-String -Quiet -SimpleMatch 'd3d12_texture_3d_binding_mask' "$sdk\src\graphics\d3d12\texture_cache.cpp")) {
+        PatchTextureTranslationFastPaths $sdk "$root\patches\rexglue-texture-translation-fastpaths.patch"
+        (Get-Item "$sdk\.mcla-patched" -Force).LastWriteTime = Get-Date
+    }
+    # When a guest memory watch fires, selectively invalidate the affected
+    # texture bindings instead of resetting every active fetch descriptor.
+    # Remains OFF unless the user is explicitly running the A/B.
+    if (-not (Select-String -Quiet -SimpleMatch 'texture_watch_selective_invalidation' "$sdk\src\graphics\pipeline\texture\cache.cpp")) {
+        PatchTextureSelectiveInvalidation $sdk "$root\patches\rexglue-texture-selective-watch-invalidation.patch"
         (Get-Item "$sdk\.mcla-patched" -Force).LastWriteTime = Get-Date
     }
     # Optional exact-key hit before redundant host size normalization.

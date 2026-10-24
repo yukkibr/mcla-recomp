@@ -25,6 +25,12 @@ Static recompilation of *Midnight Club: Los Angeles Complete Edition* (Xbox 360,
 
 Details and open problems: `docs/known-issues.md`.
 
+## Experimental DirectX 12 performance (development branch)
+
+On Windows, the current experimental work focuses on **GPU-thread CPU overhead**, not reducing visual fidelity. Texture format/tile conversion itself is dispatched to DX12 compute shaders; the host still performs repeated texture-request, descriptor and memory-watch processing. Three independent, reversible optimizations are available: early exit for already-synchronized requests, a tracked 3D fetch mask, and selective watch invalidation. Each has its own restart-only CVar and ON/OFF script. See [the texture optimization notes](docs/dx12-texture-translation-wave1-wave2.md) for implementation and test procedures; **no sustained FPS uplift is claimed before matched city benchmarks**.
+
+The last player-approved stable snapshot is preserved at [safety/stable-fps-2026-10-24](https://github.com/yukkibr/mcla-recomp/tree/safety/stable-fps-2026-10-24) (commit `1bb25c4`). A separate local backup of the patched SDK and game DLLs is required to reconstruct the identical binaries, because SDK modifications are not part of the main repository's Git history. Vulkan and the previous ULTRA preset performed worse in this PC's driving tests; the preferred base remains D3D12 with uncapped FPS, native 720p and spatial FSR.
+
 ## Which release of the game
 
 Everything here was made with, and is only known to work with, **Midnight Club: Los Angeles Complete Edition, USA/Europe, for Xbox 360** (title id `545407F8`). The hooks and function hints in `config/` are addresses in that release's executable; another region or revision would need them checked again.

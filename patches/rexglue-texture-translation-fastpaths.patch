@@ -1,0 +1,127 @@
+diff --git a/include/rex/graphics/pipeline/texture/cache.h b/include/rex/graphics/pipeline/texture/cache.h
+--- a/include/rex/graphics/pipeline/texture/cache.h
++++ b/include/rex/graphics/pipeline/texture/cache.h
+@@ -625,6 +625,8 @@
+   // Bit vector with bits reset on fetch constant writes to avoid parsing fetch
+   // constants again and again.
+   uint32_t texture_bindings_in_sync_ = 0;
++  // Read-only during draw processing; evaluated once at TextureCache creation.
++  bool texture_quick_sync_enabled_ = false;
+ };
+ 
+ }  // namespace rex::graphics
+diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
+--- a/src/graphics/pipeline/texture/cache.cpp
++++ b/src/graphics/pipeline/texture/cache.cpp
+@@ -36,6 +36,16 @@
+ REXCVAR_DEFINE_BOOL(texture_request_fast_path, false, "GPU",
+                     "Avoid redundant texture request setup and reuse temporary load vectors")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++// Bypass the entire (sometimes heavily instrumented) request path when all
++// needed Xenos texture fetch constants are synchronized and NO watched guest
++// texture memory has been invalidated. A single acquire-load before returning
++// preserves the original generation/invalidation guard. If any condition is
++// unsafe, use the unchanged authoritative RequestTextures implementation.
++// The GPU still transitions texture resources and updates LRU after this call.
++REXCVAR_DEFINE_BOOL(texture_request_quick_sync, false, "GPU",
++                    "Fast return for already-synchronized texture request batches")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
+ // An exact-key texture that is already in the per-device cache is valid
+ // without repeating the host-extent normalization. Apply only without
+@@ -249,6 +259,10 @@
+       shared_memory_(shared_memory),
+       draw_resolution_scale_x_(draw_resolution_scale_x),
+       draw_resolution_scale_y_(draw_resolution_scale_y) {
++  texture_quick_sync_enabled_ = REXCVAR_GET(texture_request_quick_sync);
++  if (texture_quick_sync_enabled_) {
++    REXGPU_INFO("Texture translation: synchronized-request quick path enabled");
++  }
+   assert_true(draw_resolution_scale_x >= 1);
+   assert_true(draw_resolution_scale_x <= kMaxDrawResolutionScaleAlongAxis);
+   assert_true(draw_resolution_scale_y >= 1);
+@@ -514,6 +528,17 @@
+ }
+ 
+ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
++  // On dense MCLA frames this function is called hundreds of thousands of
++  // times, most with already-synchronized bindings. Handle that case before
++  // constructing any profiling structs, vectors or timing lambdas. Do NOT
++  // skip memory-watch invalidation, fetch-constant writes, or opt-in probes.
++  if (texture_quick_sync_enabled_ && REXCVAR_GET(texture_request_fast_path) &&
++      (used_texture_mask & ~texture_bindings_in_sync_) == 0 &&
++      !texture_became_outdated_.load(std::memory_order_acquire) &&
++      !REXCVAR_GET(texture_request_sample_probe) &&
++      !REXCVAR_GET(dx12_texture_stage_probe)) {
++    return;
++  }
+   const bool fast_path = REXCVAR_GET(texture_request_fast_path);
+   if (fast_path) {
+     static thread_local bool enabled_reported = false;
+diff --git a/include/rex/graphics/d3d12/texture_cache.h b/include/rex/graphics/d3d12/texture_cache.h
+--- a/include/rex/graphics/d3d12/texture_cache.h
++++ b/include/rex/graphics/d3d12/texture_cache.h
+@@ -514,6 +514,8 @@
+   D3D12_CPU_DESCRIPTOR_HANDLE null_srv_descriptor_heap_start_;
+ 
+   std::array<D3D12TextureBinding, xenos::kTextureFetchConstantCount> d3d12_texture_bindings_;
++  uint32_t active_3d_texture_bindings_mask_ = 0;
++  bool texture_3d_binding_mask_enabled_ = false;
+ 
+   // Unsupported texture formats used during this frame (for research and
+   // testing).
+diff --git a/src/graphics/d3d12/texture_cache.cpp b/src/graphics/d3d12/texture_cache.cpp
+--- a/src/graphics/d3d12/texture_cache.cpp
++++ b/src/graphics/d3d12/texture_cache.cpp
+@@ -42,6 +42,12 @@
+ 
+ REXCVAR_DEFINE_BOOL(d3d12_texture_resource_pool_probe, false, "GPU",
+                     "Measure completed texture reuse, rejection reasons, and CPU resource creation time")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++
++// Do not walk every 2D texture fetch when looking for rare 3D wrapper
++// conversions: maintain a 32-bit mask on binding changes instead.
++REXCVAR_DEFINE_BOOL(d3d12_texture_3d_binding_mask, false, "GPU",
++                    "Filter 3D wrapper work using precomputed active fetch mask")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
+ namespace rex::graphics::d3d12 {
+@@ -384,6 +390,10 @@
+     : TextureCache(register_file, shared_memory, draw_resolution_scale_x, draw_resolution_scale_y),
+       command_processor_(command_processor),
+       bindless_resources_used_(bindless_resources_used) {
++  texture_3d_binding_mask_enabled_ = REXCVAR_GET(d3d12_texture_3d_binding_mask);
++  if (texture_3d_binding_mask_enabled_) {
++    REXGPU_INFO("Texture translation: tracked 3D texture fetch mask enabled");
++  }
+   resource_pool_limit_bytes_ =
+       uint64_t(std::max(0, REXCVAR_GET(d3d12_texture_resource_pool_mb))) << 20;
+   if (resource_pool_limit_bytes_) {
+@@ -734,7 +744,9 @@
+   // Pre-create 3D-as-2D wrappers before draw setup. Wrapper loading may bind
+   // compute pipelines and must happen in the texture request phase.
+   if (REXCVAR_GET(gpu_3d_to_2d_texture)) {
+-    uint32_t textures_3d = used_texture_mask;
++    uint32_t textures_3d = texture_3d_binding_mask_enabled_
++                               ? (used_texture_mask & active_3d_texture_bindings_mask_)
++                               : used_texture_mask;
+     uint32_t index_3d;
+     while (rex::bit_scan_forward(textures_3d, &index_3d)) {
+       textures_3d &= ~(uint32_t(1) << index_3d);
+@@ -2125,8 +2137,15 @@
+     D3D12TextureBinding& d3d12_binding = d3d12_texture_bindings_[binding_index];
+     d3d12_binding.Reset();
+     const TextureBinding* binding = GetValidTextureBinding(binding_index);
++    // The mask is changed only when a descriptor is built or invalidated.
++    // It includes signed-only and normal 3D fetch constants equally.
++    const uint32_t index_bit = UINT32_C(1) << binding_index;
++    active_3d_texture_bindings_mask_ &= ~index_bit;
+     if (!binding) {
+       continue;
++    }
++    if (binding->key.dimension == xenos::DataDimension::k3D) {
++      active_3d_texture_bindings_mask_ |= index_bit;
+     }
+     if (IsSignedVersionSeparateForFormat(binding->key)) {
+       if (binding->texture && texture_util::IsAnySignNotSigned(binding->swizzled_signs)) {
