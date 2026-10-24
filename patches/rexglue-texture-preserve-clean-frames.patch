@@ -1,0 +1,89 @@
+diff --git a/include/rex/graphics/pipeline/texture/cache.h b/include/rex/graphics/pipeline/texture/cache.h
+--- a/include/rex/graphics/pipeline/texture/cache.h
++++ b/include/rex/graphics/pipeline/texture/cache.h
+@@ -631,6 +631,8 @@
+   // Read-only during draw processing; evaluated once at TextureCache creation.
+   bool texture_quick_sync_enabled_ = false;
+   bool texture_selective_invalidation_enabled_ = false;
++  bool texture_preserve_clean_frames_ = false;
++  bool texture_retry_needed_ = false;
+ };
+ 
+ }  // namespace rex::graphics
+diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
+--- a/src/graphics/pipeline/texture/cache.cpp
++++ b/src/graphics/pipeline/texture/cache.cpp
+@@ -58,6 +58,15 @@
+ REXCVAR_DEFINE_BOOL(texture_watch_selective_stats, false, "GPU",
+                     "Sparse statistics on selectively refreshed bindings")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++// The stock SDK clears all texture bindings every BeginFrame, even when no
++// texture creation or upload has failed. That forces repeated descriptor,
++// guest layout and texture lookups for completely unchanged textures.
++// This option keeps valid bindings across frames, yet records any failure
++// and performs the same full reset on the next frame in that case.
++REXCVAR_DEFINE_BOOL(texture_preserve_clean_frame_bindings, false, "GPU",
++                    "Keep texture bindings across frames with no failed texture loads")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
+ // An exact-key texture that is already in the per-device cache is valid
+ // without repeating the host-extent normalization. Apply only without
+@@ -274,6 +283,11 @@
+   texture_quick_sync_enabled_ = REXCVAR_GET(texture_request_quick_sync);
+   texture_selective_invalidation_enabled_ =
+       REXCVAR_GET(texture_watch_selective_invalidation);
++  texture_preserve_clean_frames_ =
++      REXCVAR_GET(texture_preserve_clean_frame_bindings);
++  if (texture_preserve_clean_frames_) {
++    REXGPU_INFO("Texture translation: retaining clean bindings across frames");
++  }
+   if (texture_selective_invalidation_enabled_) {
+     REXGPU_INFO("Texture translation: selective dirty watch invalidation enabled");
+   }
+@@ -391,9 +405,15 @@
+ }
+ 
+ void TextureCache::BeginFrame() {
+-  // In case there was a failure to create something in the previous frame, make
+-  // sure bindings are reset so a new attempt will surely be made if the texture
+-  // is requested again.
++  // The base code forces every texture binding to be re-fetched even when
++  // all prior operations succeeded. Keep the complete reset on any creation,
++  // residency or load failure, and for the original (OFF) mode. Watchers,
++  // fetch writes, explicit eviction and other existing reset sites still
++  // invalidate their own bindings independently.
++  if (texture_preserve_clean_frames_ && !texture_retry_needed_) {
++    return;
++  }
++  texture_retry_needed_ = false;
+   ResetTextureBindings();
+ }
+ 
+@@ -721,6 +741,8 @@
+   pending_shared_memory_ranges.clear();
+   auto queue_pending_texture_load = [&](Texture* texture) {
+     if (texture == nullptr) {
++      // FindOrCreateTexture may have failed: retry next frame.
++      texture_retry_needed_ = true;
+       return;
+     }
+     for (const PendingTextureLoad& pending_load : pending_texture_loads) {
+@@ -859,12 +881,14 @@
+   const auto sampled_resident = sample_this ? SampleClock::now() : SampleClock::time_point{};
+   if (batched_shared_memory_request_succeeded) {
+     for (const PendingTextureLoad& pending_load : pending_texture_loads) {
+-      CommitPreparedTextureLoad(pending_load);
++      if (!CommitPreparedTextureLoad(pending_load)) {
++        texture_retry_needed_ = true;
++      }
+     }
+   } else {
+     for (const PendingTextureLoad& pending_load : pending_texture_loads) {
+-      if (pending_load.texture != nullptr) {
+-        LoadTextureData(*pending_load.texture);
++      if (pending_load.texture != nullptr && !LoadTextureData(*pending_load.texture)) {
++        texture_retry_needed_ = true;
+       }
+     }
+   }

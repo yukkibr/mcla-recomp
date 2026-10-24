@@ -102,6 +102,15 @@ function PatchTextureSelectiveInvalidation([string]$repo, [string]$patch) {
     Logged "sdk-patch-texture-selective-watch" { git -C $repo apply --ignore-whitespace $patch }
 }
 
+# Preserve correctly loaded texture bindings across frames, avoiding
+# blanket rebind of every fetch slot when no texture load failure occurred.
+function PatchTexturePreserveCleanFrames([string]$repo, [string]$patch) {
+    $ErrorActionPreference = "Continue"
+    git -C $repo apply --reverse --check --ignore-whitespace $patch 2>&1 | Out-Null
+    if ($LASTEXITCODE -eq 0) { "already applied: $(Split-Path $patch -Leaf)"; return }
+    Logged "sdk-patch-texture-clean-frames" { git -C $repo apply --ignore-whitespace $patch }
+}
+
 # Incremental, opt-in texture cache hashmap preallocation/creation timing.
 function PatchTextureMapReserve([string]$repo, [string]$patch) {
     $ErrorActionPreference = "Continue"
@@ -263,6 +272,11 @@ try {
     # Remains OFF unless the user is explicitly running the A/B.
     if (-not (Select-String -Quiet -SimpleMatch 'texture_watch_selective_invalidation' "$sdk\src\graphics\pipeline\texture\cache.cpp")) {
         PatchTextureSelectiveInvalidation $sdk "$root\patches\rexglue-texture-selective-watch-invalidation.patch"
+        (Get-Item "$sdk\.mcla-patched" -Force).LastWriteTime = Get-Date
+    }
+    # Bindings with no failed loads can remain valid across successive frames.
+    if (-not (Select-String -Quiet -SimpleMatch 'texture_preserve_clean_frame_bindings' "$sdk\src\graphics\pipeline\texture\cache.cpp")) {
+        PatchTexturePreserveCleanFrames $sdk "$root\patches\rexglue-texture-preserve-clean-frames.patch"
         (Get-Item "$sdk\.mcla-patched" -Force).LastWriteTime = Get-Date
     }
     # Optional exact-key hit before redundant host size normalization.

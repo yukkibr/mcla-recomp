@@ -1,5 +1,7 @@
-# In-game settings menu, plus the two display options it controls that are
-# implemented as hooks. Implemented in src/settings_menu.cpp.
+# Host settings extended into the original OPTIONS (DISPLAY and PERFORMANCE),
+# while CONTROLS and QUIT GAME stay in the pause SETTINGS tab.
+# The original Options root PM_GameOptions is found from the retail menu state
+# registry rather than allocating a second Options root. src/settings_menu.cpp.
 #
 # Ported from LARecomp's pause menu (src/mc_engine/pause_menu.cpp), with its
 # author's permission. The reverse engineering of the game's menu system that

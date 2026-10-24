@@ -1,6 +1,7 @@
 // In-game settings menu.
 //
-// Adds submenus to the Settings tab of the game's own pause menu, with rows
+// Adds DISPLAY and PERFORMANCE under the game's original OPTIONS hierarchy,
+// while keeping CONTROLS and QUIT GAME within the Settings pause tab; rows
 // bound to this project's options. The rows are objects of the game's own
 // option classes (checkbox and value rows), so they look and behave like the
 // rest of the menu.
@@ -94,6 +95,9 @@ void MclaApplyGuestRenderPreset() {
 
 REXCVAR_DEFINE_BOOL(mcla_settings_menu, true, "MCLA",
                     "Add the settings submenus to the pause menu");
+REXCVAR_DEFINE_BOOL(mcla_options_native_submenus, true, "MCLA",
+                    "Place DISPLAY and PERFORMANCE within original PM_GameOptions")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_STRING(mcla_city_profile, "custom", "MCLA",
                       "City detail preset: custom, standard, balanced, performance, minimum")
     .allowed({"custom", "standard", "balanced", "performance", "minimum"});
@@ -329,6 +333,27 @@ uint32_t MenuRootNode() {
 uint32_t MenuEngine() {
   uint32_t node = MenuRootNode();
   return node ? node + 4 : 0;
+}
+
+// State names are recovered from the retail game's own registered state table.
+// This avoids guessing that the Options screen is a substate of Settings:
+// PM_GameOptions is the retail Options root (Game/Controller/etc).
+uint32_t FindRegisteredMenuState(const char* name) {
+  uint32_t engine = MenuEngine();
+  if (!engine || !Membase()) return 0;
+  const uint32_t states = Read32(engine + 76);
+  const uint32_t count = Read32(engine + 80);
+  if (states < 0xB0000000 || count < 1 || count > 65536) return 0;
+  for (uint32_t i = 0; i < count; ++i) {
+    uint32_t state = Read32(states + i * 4);
+    if (state < 0xB0000000) continue;
+    const uint32_t key = Read32(state + 20);
+    if (key < 0x82000000 || key > 0xDFFFFFFF) continue;
+    if (std::strcmp(reinterpret_cast<const char*>(Membase() + key), name) == 0) {
+      return state;
+    }
+  }
+  return 0;
 }
 
 void SetStateName(uint32_t state, const char* name) {
@@ -606,13 +631,14 @@ struct MenuDef {
   const char* menu_key;    // submenu state name
   const ItemDef* items;
   int item_count;
+  bool under_original_options = false;
 };
 
 const MenuDef kMenus[] = {
     {"PM_MxTabDisplay", "DISPLAY", "MxDisplayMenu", kDisplayItems,
-     int(sizeof(kDisplayItems) / sizeof(kDisplayItems[0]))},
+     int(sizeof(kDisplayItems) / sizeof(kDisplayItems[0])), true},
     {"PM_MxTabPerf", "PERFORMANCE", "MxPerfMenu", kPerformanceItems,
-     int(sizeof(kPerformanceItems) / sizeof(kPerformanceItems[0]))},
+     int(sizeof(kPerformanceItems) / sizeof(kPerformanceItems[0])), true},
     {"PM_MxTabControls", "CONTROLS", "MxControlsMenu", kControlItems,
      int(sizeof(kControlItems) / sizeof(kControlItems[0]))},
 };
@@ -729,6 +755,8 @@ std::atomic<bool> g_menus_created{false};
 
 std::atomic<uint32_t> g_pause_tab{0};
 std::atomic<uint32_t> g_settings_state{0};
+std::atomic<uint32_t> g_original_options_state{0};
+std::atomic<uint32_t> g_menu_parent[kMenuCount] = {};
 std::atomic<uint32_t> g_last_list{0};
 std::atomic<uint32_t> g_pause_list{0};
 
@@ -972,8 +1000,18 @@ void CreateSubmenus() {
     return;
   }
   uint32_t settings = g_settings_state.load(std::memory_order_relaxed);
-  if (!settings) {
-    return;
+  if (!settings) return;
+  uint32_t options = REXCVAR_GET(mcla_options_native_submenus) ?
+      FindRegisteredMenuState("PM_GameOptions") : 0;
+  // Original Game Options is a distinct retail state; do not create a
+  // substitute and never remove the game's own OPTIONS entry. Fall back to
+  // the original pause Settings parent if the retail state is absent.
+  if (!options) {
+    REXLOG_INFO("settings menu: DISPLAY/PERFORMANCE original OPTIONS routing "
+                "disabled or unavailable; using SETTINGS fallback");
+  } else {
+    g_original_options_state.store(options, std::memory_order_relaxed);
+    REXLOG_INFO("settings menu: retail OPTIONS state 0x{:08X}", options);
   }
   for (int menu = 0; menu < kMenuCount; ++menu) {
     const MenuDef& def = kMenus[menu];
@@ -982,7 +1020,11 @@ void CreateSubmenus() {
     if (!button) {
       return;
     }
-    AppendMenuItem(settings, button);
+    const uint32_t parent = (def.under_original_options && options) ? options : settings;
+    AppendMenuItem(parent, button);
+    g_menu_parent[menu].store(parent, std::memory_order_relaxed);
+    REXLOG_INFO("settings menu: '{}' parent={} 0x{:08X}",
+                def.label, def.under_original_options ? "OPTIONS" : "SETTINGS", parent);
     SetStringTableText(def.button_key, def.label);
     g_menu_button_key[menu].store(AllocGuestString(def.button_key), std::memory_order_relaxed);
 
@@ -993,7 +1035,7 @@ void CreateSubmenus() {
     // Give the submenu a parent pointer without listing it as a child: the
     // engine's "find my root" walk dereferences a null result for a state
     // with no parent.
-    Write32(submenu + 32, settings);
+    Write32(submenu + 32, parent);
     g_menu_state[menu].store(submenu, std::memory_order_relaxed);
     SetStringTableText(def.menu_key, def.label);
 
@@ -1016,7 +1058,8 @@ void CreateSubmenus() {
     g_quit_button_key.store(quit_key, std::memory_order_relaxed);
   }
   g_menus_created.store(true, std::memory_order_relaxed);
-  REXLOG_INFO("settings menu: {} submenus added to the pause menu", kMenuCount);
+  REXLOG_INFO("settings menu: DISPLAY and PERFORMANCE moved to original OPTIONS; "
+              "CONTROLS and QUIT GAME remain in SETTINGS");
 }
 
 bool ButtonClicked(uint32_t key) {
@@ -1212,8 +1255,9 @@ bool mcla_menu_cancel(PPCRegister& r31) {
 
 bool mcla_menu_populate_redirect(PPCRegister& r3) {
   const int menu = g_active_menu.load(std::memory_order_relaxed);
-  uint32_t settings = g_settings_state.load(std::memory_order_relaxed);
-  if (menu >= 0 && settings && r3.u32 == settings) {
+  uint32_t parent = menu >= 0 ?
+      g_menu_parent[menu].load(std::memory_order_relaxed) : 0;
+  if (parent && r3.u32 == parent) {
     if (uint32_t submenu = g_menu_state[menu].load(std::memory_order_relaxed)) {
       r3.u64 = submenu;
     }
