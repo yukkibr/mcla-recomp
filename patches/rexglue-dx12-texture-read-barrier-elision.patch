@@ -1,0 +1,80 @@
+diff --git a/include/rex/graphics/d3d12/texture_cache.h b/include/rex/graphics/d3d12/texture_cache.h
+--- a/include/rex/graphics/d3d12/texture_cache.h
++++ b/include/rex/graphics/d3d12/texture_cache.h
+@@ -519,6 +519,7 @@
+   std::array<D3D12TextureBinding, xenos::kTextureFetchConstantCount> d3d12_texture_bindings_;
+   uint32_t active_3d_texture_bindings_mask_ = 0;
+   bool texture_3d_binding_mask_enabled_ = false;
++  bool texture_read_barrier_elision_enabled_ = false;
+ 
+   // Unsupported texture formats used during this frame (for research and
+   // testing).
+diff --git a/src/graphics/d3d12/texture_cache.cpp b/src/graphics/d3d12/texture_cache.cpp
+--- a/src/graphics/d3d12/texture_cache.cpp
++++ b/src/graphics/d3d12/texture_cache.cpp
+@@ -55,6 +55,14 @@
+ // conversions: maintain a 32-bit mask on binding changes instead.
+ REXCVAR_DEFINE_BOOL(d3d12_texture_3d_binding_mask, false, "GPU",
+                     "Filter 3D wrapper work using precomputed active fetch mask")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++
++// For each bound texture, the old code calls PushTransitionBarrier even if
++// SetResourceState returns the already requested read state. The command
++// processor discards such calls, but the call/branch still occurs for every
++// sampled resource on every draw. Opt-in precheck preserves all actual barriers.
++REXCVAR_DEFINE_BOOL(d3d12_texture_read_barrier_elision, false, "GPU",
++                    "Skip no-op read state barrier calls in texture draw setup")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
+ namespace rex::graphics::d3d12 {
+@@ -398,6 +406,11 @@
+       command_processor_(command_processor),
+       bindless_resources_used_(bindless_resources_used) {
+   texture_3d_binding_mask_enabled_ = REXCVAR_GET(d3d12_texture_3d_binding_mask);
++  texture_read_barrier_elision_enabled_ =
++      REXCVAR_GET(d3d12_texture_read_barrier_elision);
++  if (texture_read_barrier_elision_enabled_) {
++    REXGPU_INFO("DX12 texture translation: no-op read barrier calls skipped");
++  }
+   if (texture_3d_binding_mask_enabled_) {
+     REXGPU_INFO("Texture translation: tracked 3D texture fetch mask enabled");
+   }
+@@ -797,22 +810,28 @@
+     if (binding_texture != nullptr) {
+       // Will be referenced by the command list, so mark as used.
+       binding_texture->MarkAsUsed();
+-      command_processor_.PushTransitionBarrier(
+-          binding_texture->resource(),
+-          binding_texture->SetResourceState(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+-                                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
++      constexpr D3D12_RESOURCE_STATES kTextureReadStates =
+           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+-              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
++          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
++      const D3D12_RESOURCE_STATES previous =
++          binding_texture->SetResourceState(kTextureReadStates);
++      if (!texture_read_barrier_elision_enabled_ || previous != kTextureReadStates) {
++        command_processor_.PushTransitionBarrier(binding_texture->resource(),
++                                                 previous, kTextureReadStates);
++      }
+     }
+     D3D12Texture* binding_texture_signed = static_cast<D3D12Texture*>(binding->texture_signed);
+     if (binding_texture_signed != nullptr) {
+       binding_texture_signed->MarkAsUsed();
+-      command_processor_.PushTransitionBarrier(
+-          binding_texture_signed->resource(),
+-          binding_texture_signed->SetResourceState(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+-                                                   D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
++      constexpr D3D12_RESOURCE_STATES kTextureReadStates =
+           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+-              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
++          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
++      const D3D12_RESOURCE_STATES previous =
++          binding_texture_signed->SetResourceState(kTextureReadStates);
++      if (!texture_read_barrier_elision_enabled_ || previous != kTextureReadStates) {
++        command_processor_.PushTransitionBarrier(binding_texture_signed->resource(),
++                                                 previous, kTextureReadStates);
++      }
+     }
+   }
+ }

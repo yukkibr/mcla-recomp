@@ -111,6 +111,15 @@ function PatchTexturePreserveCleanFrames([string]$repo, [string]$patch) {
     Logged "sdk-patch-texture-clean-frames" { git -C $repo apply --ignore-whitespace $patch }
 }
 
+# Skip CPU calls for texture read transition barriers which would be no-ops.
+# Does not remove real D3D12 barriers: old/new state equality checked first.
+function PatchTextureReadBarrierElision([string]$repo, [string]$patch) {
+    $ErrorActionPreference = "Continue"
+    git -C $repo apply --reverse --check --ignore-whitespace $patch 2>&1 | Out-Null
+    if ($LASTEXITCODE -eq 0) { "already applied: $(Split-Path $patch -Leaf)"; return }
+    Logged "sdk-patch-texture-read-barrier-elision" { git -C $repo apply --ignore-whitespace $patch }
+}
+
 # Bounded deferred reuse of GPU texture resources (only AFTER submission completion).
 function PatchTextureDeferredRecycle([string]$repo, [string]$patch) {
     $ErrorActionPreference = "Continue"
@@ -315,6 +324,12 @@ try {
     # last submission. Applies atop existing bounded pool + telemetry patch.
     if (-not (Select-String -Quiet -SimpleMatch 'd3d12_texture_deferred_recycle' "$sdk\src\graphics\d3d12\texture_cache.cpp")) {
         PatchTextureDeferredRecycle $sdk "$root\patches\rexglue-dx12-deferred-gpu-texture-reuse.patch"
+        (Get-Item "$sdk\.mcla-patched" -Force).LastWriteTime = Get-Date
+    }
+    # Optional removal of empty transition-barrier calls in the GPU Commands
+    # draw loop, applied after the D3D12 texture cache patches.
+    if (-not (Select-String -Quiet -SimpleMatch 'd3d12_texture_read_barrier_elision' "$sdk\src\graphics\d3d12\texture_cache.cpp")) {
+        PatchTextureReadBarrierElision $sdk "$root\patches\rexglue-dx12-texture-read-barrier-elision.patch"
         (Get-Item "$sdk\.mcla-patched" -Force).LastWriteTime = Get-Date
     }
     # -----------------------------------------------------------------------
