@@ -95,8 +95,9 @@ void MclaApplyGuestRenderPreset() {
 
 REXCVAR_DEFINE_BOOL(mcla_settings_menu, true, "MCLA",
                     "Add the settings submenus to the pause menu");
-REXCVAR_DEFINE_BOOL(mcla_options_native_submenus, true, "MCLA",
-                    "Place DISPLAY and PERFORMANCE within original PM_GameOptions")
+REXCVAR_DEFINE_BOOL(mcla_options_native_submenus, false, "MCLA",
+                    "Experimental: route DISPLAY/PERFORMANCE through original PM_GameOptions; "
+                    "original Options uses a separate list dispatcher")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_STRING(mcla_city_profile, "custom", "MCLA",
                       "City detail preset: custom, standard, balanced, performance, minimum")

@@ -1,0 +1,124 @@
+diff --git a/include/rex/graphics/d3d12/texture_cache.h b/include/rex/graphics/d3d12/texture_cache.h
+--- a/include/rex/graphics/d3d12/texture_cache.h
++++ b/include/rex/graphics/d3d12/texture_cache.h
+@@ -230,6 +230,7 @@
+     Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+     D3D12_RESOURCE_STATES state;
+     uint64_t bytes;
++    uint64_t last_submission = 0;
+   };
+   void RecycleTextureResource(ID3D12Resource* resource, D3D12_RESOURCE_STATES state,
+                               uint64_t last_submission, uint64_t bytes);
+@@ -237,6 +238,8 @@
+   std::vector<PooledResource> resource_pool_;
+   uint64_t resource_pool_bytes_ = 0;
+   uint64_t resource_pool_limit_bytes_ = 0;
++  bool resource_pool_deferred_recycle_ = false;
++  uint64_t resource_pool_deferred_stored_ = 0;
+   uint64_t resource_pool_hits_ = 0;
+   uint64_t resource_pool_misses_ = 0;
+   // Optional read-only GPU Commands CPU telemetry. All these counters are
+diff --git a/src/graphics/d3d12/texture_cache.cpp b/src/graphics/d3d12/texture_cache.cpp
+--- a/src/graphics/d3d12/texture_cache.cpp
++++ b/src/graphics/d3d12/texture_cache.cpp
+@@ -42,6 +42,13 @@
+ 
+ REXCVAR_DEFINE_BOOL(d3d12_texture_resource_pool_probe, false, "GPU",
+                     "Measure completed texture reuse, rejection reasons, and CPU resource creation time")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++
++// Preserve resources that are still referenced by unfinished GPU commands,
++// then only recycle them after GetCompletedSubmission passes their last use.
++// Enforced bounded by d3d12_texture_resource_pool_mb, with no GPU fence waits.
++REXCVAR_DEFINE_BOOL(d3d12_texture_deferred_recycle, false, "GPU",
++                    "Allow bounded reuse of textures after in-flight GPU work completes")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
+ // Do not walk every 2D texture fetch when looking for rare 3D wrapper
+@@ -396,6 +403,11 @@
+   }
+   resource_pool_limit_bytes_ =
+       uint64_t(std::max(0, REXCVAR_GET(d3d12_texture_resource_pool_mb))) << 20;
++  resource_pool_deferred_recycle_ = REXCVAR_GET(d3d12_texture_deferred_recycle);
++  if (resource_pool_deferred_recycle_ && resource_pool_limit_bytes_) {
++    REXGPU_INFO("DX12 deferred GPU-safe texture resource recycling ON; budget={} MiB",
++                resource_pool_limit_bytes_ >> 20);
++  }
+   if (resource_pool_limit_bytes_) {
+     REXGPU_INFO("DX12 texture resource reuse experiment: {} MB",
+                 resource_pool_limit_bytes_ >> 20);
+@@ -1577,14 +1589,30 @@
+     if (probe) ++resource_pool_reject_untracked_;
+     return;
+   }
+-  if (last_submission > command_processor_.GetCompletedSubmission()) {
++  const uint64_t completed = command_processor_.GetCompletedSubmission();
++  const bool busy = last_submission > completed;
++  if (busy && !resource_pool_deferred_recycle_) {
+     if (probe) ++resource_pool_reject_gpu_busy_;
+     return;
+   }
++  // The pool is capped, including resources awaiting GPU completion.
++  // Never evict a busy resource that we chose to retain: release only
++  // completed allocations, otherwise decline this candidate unchanged.
+   while (!resource_pool_.empty() &&
+          resource_pool_bytes_ + bytes > resource_pool_limit_bytes_) {
+-    resource_pool_bytes_ -= resource_pool_.front().bytes;
+-    resource_pool_.erase(resource_pool_.begin());
++    size_t evict_index = resource_pool_.size();
++    for (size_t i = 0; i < resource_pool_.size(); ++i) {
++      if (resource_pool_[i].last_submission <= completed) {
++        evict_index = i;
++        break;
++      }
++    }
++    if (evict_index == resource_pool_.size()) {
++      if (probe) ++resource_pool_reject_gpu_busy_;
++      return;
++    }
++    resource_pool_bytes_ -= resource_pool_[evict_index].bytes;
++    resource_pool_.erase(resource_pool_.begin() + evict_index);
+     if (probe) ++resource_pool_evictions_;
+   }
+   PooledResource entry{};
+@@ -1592,6 +1620,8 @@
+   entry.resource = resource;
+   entry.state = state;
+   entry.bytes = bytes;
++  entry.last_submission = last_submission;
++  if (busy) ++resource_pool_deferred_stored_;
+   resource_pool_.push_back(std::move(entry));
+   resource_pool_bytes_ += bytes;
+   if (probe) {
+@@ -1620,7 +1650,7 @@
+       "recycle_attempts={} recycled={} reject_untracked={} "
+       "reject_busy={} reject_oversized={} reject_other={} "
+       "reuses={} misses={} desc_misses={} evictions={} "
+-      "pool_entries={} pool_mb={:.2f} pool_peak_mb={:.2f}",
++      "pool_entries={} pool_mb={:.2f} pool_peak_mb={:.2f} deferred_stored={}",
+       resource_pool_committed_creates_, resource_pool_committed_failures_,
+       double(resource_pool_committed_us_) / 1000.0,
+       double(resource_pool_committed_peak_us_) / 1000.0,
+@@ -1630,7 +1660,8 @@
+       resource_pool_hits_, resource_pool_misses_,
+       resource_pool_description_misses_, resource_pool_evictions_,
+       resource_pool_.size(), double(resource_pool_bytes_) / (1024.0 * 1024.0),
+-      double(resource_pool_peak_bytes_) / (1024.0 * 1024.0));
++      double(resource_pool_peak_bytes_) / (1024.0 * 1024.0),
++      resource_pool_deferred_stored_);
+ }
+ 
+ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(TextureKey key) {
+@@ -1669,8 +1700,12 @@
+   D3D12_RESOURCE_STATES resource_state = D3D12_RESOURCE_STATE_COPY_DEST;
+   Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+   if (resource_pool_limit_bytes_) {
++    const uint64_t completed = command_processor_.GetCompletedSubmission();
+     for (size_t i = resource_pool_.size(); i-- > 0;) {
+       const auto& candidate = resource_pool_[i];
++      // Absolutely never overwrite texture storage referenced by
++      // an unfinished GPU submission, even for an exact descriptor match.
++      if (candidate.last_submission > completed) continue;
+       const auto& old = candidate.desc;
+       if (old.Dimension != desc.Dimension || old.Alignment != desc.Alignment ||
+           old.Width != desc.Width || old.Height != desc.Height ||

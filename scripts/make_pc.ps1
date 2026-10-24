@@ -111,6 +111,14 @@ function PatchTexturePreserveCleanFrames([string]$repo, [string]$patch) {
     Logged "sdk-patch-texture-clean-frames" { git -C $repo apply --ignore-whitespace $patch }
 }
 
+# Bounded deferred reuse of GPU texture resources (only AFTER submission completion).
+function PatchTextureDeferredRecycle([string]$repo, [string]$patch) {
+    $ErrorActionPreference = "Continue"
+    git -C $repo apply --reverse --check --ignore-whitespace $patch 2>&1 | Out-Null
+    if ($LASTEXITCODE -eq 0) { "already applied: $(Split-Path $patch -Leaf)"; return }
+    Logged "sdk-patch-texture-deferred-recycle" { git -C $repo apply --ignore-whitespace $patch }
+}
+
 # Incremental, opt-in texture cache hashmap preallocation/creation timing.
 function PatchTextureMapReserve([string]$repo, [string]$patch) {
     $ErrorActionPreference = "Continue"
@@ -303,6 +311,12 @@ try {
         (Get-Item "$sdk\.mcla-patched" -Force).LastWriteTime = Get-Date
     }
 
+    # Recycle texture resource allocations only after the GPU completes the
+    # last submission. Applies atop existing bounded pool + telemetry patch.
+    if (-not (Select-String -Quiet -SimpleMatch 'd3d12_texture_deferred_recycle' "$sdk\src\graphics\d3d12\texture_cache.cpp")) {
+        PatchTextureDeferredRecycle $sdk "$root\patches\rexglue-dx12-deferred-gpu-texture-reuse.patch"
+        (Get-Item "$sdk\.mcla-patched" -Force).LastWriteTime = Get-Date
+    }
     # -----------------------------------------------------------------------
     Step "3/6 build and install the SDK (the long step, once)"
     # -Force on both: a hidden file (the marker often is one) is invisible to
