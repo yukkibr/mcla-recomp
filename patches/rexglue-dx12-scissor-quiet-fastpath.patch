@@ -1,0 +1,91 @@
+diff --git a/include/rex/graphics/d3d12/command_processor.h b/include/rex/graphics/d3d12/command_processor.h
+index 4fa35ac..90a70b7 100644
+--- a/include/rex/graphics/d3d12/command_processor.h
++++ b/include/rex/graphics/d3d12/command_processor.h
+@@ -492,6 +492,8 @@ class D3D12CommandProcessor : public CommandProcessor {
+   ScissorCacheKey previous_scissor_key_{};
+   draw_util::Scissor previous_scissor_{};
+   bool scissor_cache_valid_ = false;
++  bool scissor_cache_stats_enabled_ = false;
++  bool scissor_cache_audit_enabled_ = false;
+   uint64_t scissor_cache_hits_ = 0;
+   uint64_t scissor_cache_misses_ = 0;
+   uint64_t scissor_cache_audit_samples_ = 0;
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index f88bb01..3ec88c9 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -45,6 +45,13 @@ REXCVAR_DEFINE_BOOL(d3d12_scissor_cache_audit, false, "GPU/D3D12",
+                     "Verify every 2048th cached scissor against the original decoder")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
++// Preserve scissor cache reuse while avoiding counter increments and logs
++// for each draw in the release fast path. The stats can be enabled during
++// a separate benchmark session, without changing GPU behavior.
++REXCVAR_DEFINE_BOOL(d3d12_scissor_cache_stats, false, "GPU/D3D12",
++                    "Enable scissor cache counters and periodic log messages")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++
+ REXCVAR_DEFINE_BOOL(d3d12_hitch_probe, false, "GPU/D3D12",
+                     "Diagnose CPU-side draw, texture, pipeline, GPU fence and frame submission times")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+@@ -167,6 +174,8 @@ namespace shaders {
+ D3D12CommandProcessor::D3D12CommandProcessor(D3D12GraphicsSystem* graphics_system,
+                                              system::KernelState* kernel_state)
+     : CommandProcessor(graphics_system, kernel_state), deferred_command_list_(*this) {
++  scissor_cache_stats_enabled_ = REXCVAR_GET(d3d12_scissor_cache_stats);
++  scissor_cache_audit_enabled_ = REXCVAR_GET(d3d12_scissor_cache_audit);
+   legacy_readback_memexport_cvar_name_ = "d3d12_readback_memexport";
+ }
+ D3D12CommandProcessor::~D3D12CommandProcessor() = default;
+@@ -2587,11 +2596,13 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+         regs[XE_GPU_REG_RB_SURFACE_INFO]};
+     if (scissor_cache_valid_ && scissor_key == previous_scissor_key_) {
+       scissor = previous_scissor_;
+-      ++scissor_cache_hits_;
++      if (scissor_cache_stats_enabled_ || scissor_cache_audit_enabled_) {
++        ++scissor_cache_hits_;
++      }
+       // Diagnostic sampling is optional, and extremely sparse (~0.05%).
+       // Any disagreement stops the cache immediately for the rest of this
+       // session and uses the fresh, authoritative rectangle for this draw.
+-      if (REXCVAR_GET(d3d12_scissor_cache_audit) &&
++      if (scissor_cache_audit_enabled_ &&
+           (scissor_cache_hits_ & UINT64_C(2047)) == 0) {
+         draw_util::Scissor reference{};
+         draw_util::GetScissor(regs, reference);
+@@ -2615,18 +2626,22 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+       previous_scissor_key_ = scissor_key;
+       previous_scissor_ = scissor;
+       scissor_cache_valid_ = true;
+-      ++scissor_cache_misses_;
+-    }
+-    const uint64_t samples = scissor_cache_hits_ + scissor_cache_misses_;
+-    // Keep telemetry out of the hot path: one early sample, then every
+-    // 262,144 draws, not every few thousand draws during busy city scenes.
+-    if (samples == UINT64_C(16384) || (samples & UINT64_C(262143)) == 0) {
+-      REXGPU_INFO("DX12 scissor cache: {} hits / {} recalculations ({:.1f}% reuse)",
+-                  scissor_cache_hits_, scissor_cache_misses_,
+-                  100.0 * double(scissor_cache_hits_) / double(samples));
+-      if (REXCVAR_GET(d3d12_scissor_cache_audit)) {
+-        REXGPU_INFO("DX12 scissor audit: {} comparisons / {} mismatches",
+-                    scissor_cache_audit_samples_, scissor_cache_audit_errors_);
++      if (scissor_cache_stats_enabled_) {
++        ++scissor_cache_misses_;
++      }
++    }
++    // The scissor cache still serves the same rects. In normal gameplay,
++    // skip statistics and periodic formatting on this extremely hot path.
++    if (scissor_cache_stats_enabled_) {
++      const uint64_t samples = scissor_cache_hits_ + scissor_cache_misses_;
++      if (samples == UINT64_C(16384) || (samples & UINT64_C(262143)) == 0) {
++        REXGPU_INFO("DX12 scissor cache: {} hits / {} recalculations ({:.1f}% reuse)",
++                    scissor_cache_hits_, scissor_cache_misses_,
++                    100.0 * double(scissor_cache_hits_) / double(samples));
++        if (scissor_cache_audit_enabled_) {
++          REXGPU_INFO("DX12 scissor audit: {} comparisons / {} mismatches",
++                      scissor_cache_audit_samples_, scissor_cache_audit_errors_);
++        }
+       }
+     }
+   } else {

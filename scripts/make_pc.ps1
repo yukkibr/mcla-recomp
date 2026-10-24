@@ -75,6 +75,15 @@ function PatchTextureUnscaledPrecheck([string]$repo, [string]$patch) {
     Logged "sdk-patch-texture-unscaled-precheck" { git -C $repo apply --ignore-whitespace $patch }
 }
 
+# Incremental patch on top of audited DX12 scissor cache. Keeps original
+# scissor behavior and moves per-draw metrics behind an explicit opt-in flag.
+function PatchScissorQuiet([string]$repo, [string]$patch) {
+    $ErrorActionPreference = "Continue"
+    git -C $repo apply --reverse --check --ignore-whitespace $patch 2>&1 | Out-Null
+    if ($LASTEXITCODE -eq 0) { "already applied: $(Split-Path $patch -Leaf)"; return }
+    Logged "sdk-patch-scissor-quiet" { git -C $repo apply --ignore-whitespace $patch }
+}
+
 # Incremental, opt-in texture cache hashmap preallocation/creation timing.
 function PatchTextureMapReserve([string]$repo, [string]$patch) {
     $ErrorActionPreference = "Continue"
@@ -194,6 +203,12 @@ try {
     # Optional low-frequency scissor correctness audit, before any resource-pool patch.
     if (-not (Select-String -Quiet -SimpleMatch "scissor_cache_audit_samples_" "$sdk\include\rex\graphics\d3d12\command_processor.h")) {
         Patch "sdk-patch-scissor-audit" $sdk "$root\patches\rexglue-dx12-scissor-audit.patch"
+        (Get-Item "$sdk\.mcla-patched" -Force).LastWriteTime = Get-Date
+    }
+    # Cache hit/miss diagnostics are now restart-only opt-in. Preserve
+    # scissor reuse and the correctness audit independent of statistics.
+    if (-not (Select-String -Quiet -SimpleMatch "d3d12_scissor_cache_stats" "$sdk\src\graphics\d3d12\command_processor.cpp")) {
+        PatchScissorQuiet $sdk "$root\patches\rexglue-dx12-scissor-quiet-fastpath.patch"
         (Get-Item "$sdk\.mcla-patched" -Force).LastWriteTime = Get-Date
     }
     # Frame hitch attribution without enabling the expensive ReXGlue CSV counters.
