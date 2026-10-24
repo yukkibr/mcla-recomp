@@ -2,6 +2,7 @@
 // Uses the existing ReXGlue ImGui presenter (no external window or DX12 hooks).
 #include "fps_overlay.h"
 #include "hitch_correlation.h"
+#include "gpu_vram_budget.h"
 
 #include <array>
 #include <atomic>
@@ -136,7 +137,7 @@ class MclaFpsHud final : public rex::ui::ImGuiDialog {
       draw_reported = true;
     }
     const auto stats = MclaReadGuestFps();
-    const ImVec2 size(220.0f, 81.0f);
+    const ImVec2 size(260.0f, 147.0f);
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - size.x - 12.0f, 12.0f),
                             ImGuiCond_Always);
     ImGui::SetNextWindowSize(size, ImGuiCond_Always);
@@ -158,6 +159,22 @@ class MclaFpsHud final : public rex::ui::ImGuiDialog {
         ImGui::TextDisabled("Avg frame  %.1f ms", stats.frame_time_ms);
         // A 90ms worst frame is a hitch (~11 FPS for that frame), not 90 FPS.
         ImGui::TextDisabled("Worst frame  %.1f ms", stats.worst_frame_ms);
+      }
+      const auto vram = MclaReadGpuVram();
+      if (vram.valid) {
+        ImGui::Separator();
+        ImGui::TextDisabled("VRAM PROCESS  %llu / %llu MiB",
+                            static_cast<unsigned long long>(vram.used_mib),
+                            static_cast<unsigned long long>(vram.budget_mib));
+        ImGui::TextDisabled("GPU VRAM TOTAL  %llu MiB",
+                            static_cast<unsigned long long>(vram.dedicated_mib));
+        const float fraction = vram.budget_mib ?
+            float(vram.used_mib) / float(vram.budget_mib) : 0.0f;
+        ImGui::PushStyleColor(ImGuiCol_PlotHistogram,
+                              ImVec4(0.59f, 0.40f, 0.83f, 1.0f));
+        ImGui::ProgressBar(fraction > 1.0f ? 1.0f : fraction,
+                           ImVec2(-1.0f, 7.0f), "");
+        ImGui::PopStyleColor();
       }
     }
     ImGui::End();

@@ -2,6 +2,7 @@
 
 #include "mcla_app.h"
 #include "fps_overlay.h"
+#include "gpu_vram_budget.h"
 
 #include <filesystem>
 
@@ -57,6 +58,10 @@ void MclaApp::OnPreSetup(rex::RuntimeConfig& config) {
       REXLOG_ERROR("could not load the xenos GPU plugin with backend '{}'", backend);
     }
   }
+  // The plugin defines its texture-cache CVars during DLL load.
+  // Apply the budget only AFTER the chosen graphics plugin is available,
+  // but BEFORE Runtime::Setup allocates cache/resources.
+  MclaConfigureTextureCacheBudget();
 }
 
 void MclaApp::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
@@ -85,6 +90,10 @@ void MclaApp::OnPostSetup() {
     return result;
   });
 
+
+  REXLOG_INFO("MCLA VRAM effective ReXGlue texture limits: soft={} hard={} MiB",
+              rex::cvar::GetFlagByName("texture_cache_memory_limit_soft"),
+              rex::cvar::GetFlagByName("texture_cache_memory_limit_hard"));
 
   // The game probes for loose city data on a "t:" drive that retail consoles
   // do not have. Give it a device so the probes fail with "not found" rather

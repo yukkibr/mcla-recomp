@@ -1,0 +1,10 @@
+# MCLA guest D-cache flush (0x821D5510, 56-byte PPC function).
+# Original code loops per 128-byte line executing DCBF/DCBST; ReXGlue's
+# generated code already treats both PowerPC cache ops as no-ops on x86-64.
+# A seq_cst host fence preserves publication ordering for worker/audio threads.
+# Hook at entry, branch to the original BLR only when enabled. With OFF the
+# entire PPC function runs unmodified. No guest memory or physics is changed.
+[[midasm_hook]]
+address = 0x821D5510
+name = "mcla_fast_guest_cache_flush"
+jump_address_on_true = 0x821D5544

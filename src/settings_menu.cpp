@@ -479,6 +479,14 @@ constexpr const char* kStallGuardLabels[] = {"ORIGINAL", "GENTLE", "STRONG"};
 // Optional guest-timer pacing without changing the player's FPS TARGET.
 constexpr const char* kPacingModes[] = {"off", "adaptive", "steady45"};
 constexpr const char* kPacingLabels[] = {"OFF (UNCAPPED)", "ADAPTIVE", "STEADY 45"};
+// Texture cache only: not a reservation or full-process VRAM limiter.
+// Auto and MAX SAFE are clamped at startup to the DXGI Windows GPU budget.
+constexpr const char* kVramBudgetValues[] = {"-1", "0", "1024", "1536", "2048",
+                                             "3072", "4096", "5120", "6144", "-2"};
+constexpr const char* kVramBudgetLabels[] = {"EXISTING", "AUTO SAFE", "1024 MB",
+                                             "1536 MB", "2048 MB", "3072 MB",
+                                             "4096 MB", "5120 MB", "6144 MB",
+                                             "MAX SAFE"};
 #endif
 constexpr const char* kPromptValues[] = {"auto", "xbox", "playstation"};
 constexpr const char* kPromptLabels[] = {"AUTO", "XBOX", "PLAYSTATION"};
@@ -508,6 +516,8 @@ const ItemDef kDisplayItems[] = {
      kFpsTargetCount, "%.0f", "UNCAPPED"},
     {"PM_MxFpsCounter", ItemKind::kToggle, "mcla_show_fps", "FPS COUNTER"},
 #if !REX_PLATFORM_PS5
+    {"PM_MxVramBudget", ItemKind::kStringChoice, "mcla_texture_cache_budget_mb",
+     "VRAM TEXTURE CACHE (NEXT START)", kVramBudgetValues, kVramBudgetLabels, nullptr, 10},
     {"PM_MxFrameGuard", ItemKind::kStringChoice, "mcla_frame_stall_guard_ms",
      "FRAME STALL GUARD", kStallGuardValues, kStallGuardLabels, nullptr, 3},
     // Neither means anything on the console: there is one display mode, and

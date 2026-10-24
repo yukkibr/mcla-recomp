@@ -20,6 +20,8 @@ set(MCLA_SOURCES
     src/motion_probe.cpp
     src/hitch_correlation.cpp
     src/fps_overlay.cpp
+    src/gpu_vram_budget.cpp
+    src/threading_perf.cpp
     src/render_perf.cpp
     src/perf_options.cpp
     src/warp_fix.cpp
@@ -53,5 +55,5 @@ endif()
 
 if(WIN32)
     # timeBeginPeriod for the frame limiter.
-    target_link_libraries(mcla PRIVATE winmm)
+    target_link_libraries(mcla PRIVATE winmm dxgi)
 endif()
